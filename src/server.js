@@ -1,7 +1,4 @@
-const dns = require('dns');
-if (typeof dns.setDefaultResultOrder === 'function') {
-  dns.setDefaultResultOrder('ipv4first');
-}
+require('./dnsPatch');
 
 const express = require('express');
 const http = require('http');

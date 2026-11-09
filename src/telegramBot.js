@@ -4,10 +4,7 @@
  * and receive live results directly in their Telegram chat via commands and buttons.
  */
 
-const dns = require('dns');
-if (typeof dns.setDefaultResultOrder === 'function') {
-  dns.setDefaultResultOrder('ipv4first');
-}
+require('./dnsPatch');
 
 const fs = require('fs');
 const path = require('path');
@@ -16,7 +13,7 @@ const db = require('./db');
 const config = require('./config');
 const telegramClient = require('./telegramClient');
 const { checkInstagramProfile } = require('./igChecker');
-const { downloadTargetContent, fetchActiveStories } = require('./downloader');
+const { downloadTargetContent, fetchActiveStories, fetchHighlights } = require('./downloader');
 const { dispatchTransitionAlert } = require('./notifier');
 
 class TelegramBotService {
@@ -204,6 +201,13 @@ class TelegramBotService {
       return this.handleStoriesCommand(token, chatId, arg1, settings);
     }
 
+    if (cmd === '/highlights' || cmd === '/hl' || cmd === '/highlight') {
+      if (!arg1) {
+        return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/highlights instagram</code>');
+      }
+      return this.handleHighlightsCommand(token, chatId, arg1, settings);
+    }
+
     if (cmd === '/reels' || cmd === '/reel') {
       if (!arg1) {
         return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/reels instagram</code>');
@@ -301,6 +305,11 @@ class TelegramBotService {
       return this.handleStoriesCommand(token, chatId, username, settings);
     }
 
+    if (data.startsWith('highlights:') || data.startsWith('hl:')) {
+      const username = data.split(':')[1];
+      return this.handleHighlightsCommand(token, chatId, username, settings);
+    }
+
     if (data.startsWith('reels:')) {
       const username = data.split(':')[1];
       return this.handleReelsCommand(token, chatId, username, settings);
@@ -337,6 +346,7 @@ class TelegramBotService {
       `📂 <b>Media Access & Downloads:</b>`,
       `• <code>/media &lt;username&gt;</code> - Interactive media control center`,
       `• <code>/stories &lt;username&gt;</code> - Play active stories (photos & videos)`,
+      `• <code>/highlights &lt;username&gt;</code> - Play full highlight stories & reels`,
       `• <code>/reels &lt;username&gt;</code> - Stream & play reels directly in chat`,
       `• <code>/posts &lt;username&gt;</code> - Download posts, carousels & photo albums`,
       `• <code>/zip &lt;username&gt;</code> - Download full media archive as a ZIP file`,
@@ -438,11 +448,14 @@ class TelegramBotService {
           { text: '📱 Stories', callback_data: `stories:${clean}` }
         ],
         [
-          { text: '🎬 Reels', callback_data: `reels:${clean}` },
-          { text: '📸 Posts', callback_data: `posts:${clean}` }
+          { text: '✨ Highlights', callback_data: `highlights:${clean}` },
+          { text: '🎬 Reels', callback_data: `reels:${clean}` }
         ],
         [
-          { text: '📦 Full ZIP', callback_data: `zip:${clean}` },
+          { text: '📸 Posts', callback_data: `posts:${clean}` },
+          { text: '📦 Full ZIP', callback_data: `zip:${clean}` }
+        ],
+        [
           { text: '➕ Add Monitor', callback_data: `add:${clean}` }
         ]
       ];
@@ -656,10 +669,11 @@ class TelegramBotService {
           { text: `📦 Download All (${validStories.length}) as ZIP`, callback_data: `zip:${clean}` }
         ],
         [
-          { text: '🎬 View Reels', callback_data: `reels:${clean}` },
-          { text: '📸 View Posts', callback_data: `posts:${clean}` }
+          { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
+          { text: '🎬 View Reels', callback_data: `reels:${clean}` }
         ],
         [
+          { text: '📸 View Posts', callback_data: `posts:${clean}` },
           { text: '📂 Media Menu', callback_data: `media:${clean}` }
         ]
       ];
@@ -669,6 +683,104 @@ class TelegramBotService {
       });
     } catch (err) {
       await this.sendMessage(token, chatId, `❌ Failed fetching stories for @${clean}: ${err.message}`);
+    }
+  }
+
+  async handleHighlightsCommand(token, chatId, username, settings) {
+    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    await this.sendMessage(token, chatId, `⏳ <b>Fetching highlights for @${clean}...</b>\nDiscovering highlight reels and downloading story photos & videos.`);
+    await this.sendChatAction(token, chatId, 'upload_photo');
+
+    try {
+      const result = await fetchHighlights(clean, {
+        sessionCookie: settings.sessionCookie,
+        proxyUrl: settings.proxyUrl
+      });
+
+      const items = result.items || [];
+      if (items.length === 0) {
+        return this.sendMessage(token, chatId, `ℹ️ No story highlights found for <b>@${clean}</b>.`, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '📱 Check Stories', callback_data: `stories:${clean}` },
+                { text: '🎬 Check Reels', callback_data: `reels:${clean}` }
+              ],
+              [
+                { text: '📂 Media Menu', callback_data: `media:${clean}` }
+              ]
+            ]
+          }
+        });
+      }
+
+      // Group items by highlight title
+      const byTitle = {};
+      for (const it of items) {
+        const title = it.highlightTitle || 'Highlights';
+        if (!byTitle[title]) byTitle[title] = [];
+        byTitle[title].push(it);
+      }
+
+      const titleCount = Object.keys(byTitle).length;
+      await this.sendMessage(token, chatId, `✨ Found <b>${titleCount} highlight reel(s)</b> (${items.length} total media) for <b>@${clean}</b>! Delivering below:`);
+
+      for (const [title, hlItems] of Object.entries(byTitle)) {
+        const validPhotos = [];
+        const validVideos = [];
+
+        for (const it of hlItems) {
+          const fPath = resolveLocalMediaPath(it, clean);
+          if (fPath && fs.existsSync(fPath)) {
+            const isVideo = it.type?.includes('video') || fPath.endsWith('.mp4');
+            if (isVideo) {
+              validVideos.push({ ...it, fullPath: fPath });
+            } else {
+              validPhotos.push({
+                fullPath: fPath,
+                fileName: path.basename(fPath),
+                caption: it.caption || `Highlight: ${title}`
+              });
+            }
+          }
+        }
+
+        // Send photos in album (chunks of up to 10)
+        if (validPhotos.length === 1) {
+          await this.sendLocalPhoto(token, chatId, validPhotos[0].fullPath, `✨ <b>@${clean}</b> [${escapeHtml(title)}]\n${escapeHtml(validPhotos[0].caption)}`);
+        } else if (validPhotos.length > 1) {
+          for (let i = 0; i < Math.min(validPhotos.length, 10); i += 10) {
+            const chunk = validPhotos.slice(i, i + 10);
+            await telegramClient.sendMediaGroup(token, chatId, chunk, `✨ <b>@${clean}</b> highlight [${escapeHtml(title)}]`);
+          }
+        }
+
+        // Send videos (playable MP4s)
+        for (let i = 0; i < Math.min(validVideos.length, 4); i++) {
+          const v = validVideos[i];
+          const cap = `✨ <b>@${clean}</b> [${escapeHtml(title)}] (${i + 1}/${validVideos.length})\n⏰ ${escapeHtml(v.caption || '')}`;
+          await this.sendLocalVideo(token, chatId, v.fullPath, cap);
+        }
+      }
+
+      const buttons = [
+        [
+          { text: `📦 Download All (${items.length}) as ZIP`, callback_data: `zip:${clean}` }
+        ],
+        [
+          { text: '📱 Active Stories', callback_data: `stories:${clean}` },
+          { text: '🎬 Reels & Videos', callback_data: `reels:${clean}` }
+        ],
+        [
+          { text: '📂 Media Menu', callback_data: `media:${clean}` }
+        ]
+      ];
+
+      await this.sendMessage(token, chatId, `✨ All highlight media delivered for <b>@${clean}</b>!`, {
+        reply_markup: { inline_keyboard: buttons }
+      });
+    } catch (err) {
+      await this.sendMessage(token, chatId, `❌ Failed fetching highlights for @${clean}: ${err.message}`);
     }
   }
 
@@ -869,6 +981,21 @@ class TelegramBotService {
         reelsCount = pFiles.filter(f => f.endsWith('.mp4')).length;
         postsCount = pFiles.filter(f => f.endsWith('.jpg') || f.endsWith('.png')).length;
       }
+      const highlightsDir = path.join(userDir, 'highlights');
+      if (fs.existsSync(highlightsDir) && highlightsCount === 0) {
+        function countHlFiles(dir) {
+          let cnt = 0;
+          try {
+            const ents = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of ents) {
+              if (e.isDirectory()) cnt += countHlFiles(path.join(dir, e.name));
+              else if (e.isFile() && !e.name.includes('_thumb') && (e.name.endsWith('.jpg') || e.name.endsWith('.mp4'))) cnt++;
+            }
+          } catch (e) {}
+          return cnt;
+        }
+        highlightsCount = countHlFiles(highlightsDir);
+      }
     }
 
     const totalItems = storiesCount + reelsCount + postsCount + highlightsCount;
@@ -878,9 +1005,9 @@ class TelegramBotService {
       `📂 <b>Media Library Hub: @${clean}</b>`,
       `━━━━━━━━━━━━━━━━━━━━━━━━━`,
       `📱 <b>Active Stories:</b> <code>${storiesCount} items</code>`,
+      `✨ <b>Highlights:</b> <code>${highlightsCount} items</code>`,
       `🎬 <b>Reels & Videos:</b> <code>${reelsCount} items</code>`,
       `📸 <b>Posts & Slides:</b> <code>${postsCount} items</code>`,
-      highlightsCount > 0 ? `✨ <b>Highlights:</b> <code>${highlightsCount} items</code>` : null,
       `💾 <b>Total Archive Size:</b> <code>${sizeStr}</code> (${totalItems} files)`,
       `━━━━━━━━━━━━━━━━━━━━━━━━━`,
       `<i>Tap any button below to view, stream, or download directly in Telegram:</i>`
@@ -889,14 +1016,15 @@ class TelegramBotService {
     const buttons = [
       [
         { text: `📱 Stories (${storiesCount})`, callback_data: `stories:${clean}` },
-        { text: `🎬 Reels (${reelsCount})`, callback_data: `reels:${clean}` }
+        { text: `✨ Highlights (${highlightsCount})`, callback_data: `highlights:${clean}` }
       ],
       [
-        { text: `📸 Posts (${postsCount})`, callback_data: `posts:${clean}` },
+        { text: `🎬 Reels (${reelsCount})`, callback_data: `reels:${clean}` },
+        { text: `📸 Posts (${postsCount})`, callback_data: `posts:${clean}` }
+      ],
+      [
+        { text: `📦 Download All as ZIP (${sizeStr})`, callback_data: `zip:${clean}` },
         { text: `🖼️ HD Avatar`, callback_data: `avatar:${clean}` }
-      ],
-      [
-        { text: `📦 Download All as ZIP (${sizeStr})`, callback_data: `zip:${clean}` }
       ],
       [
         { text: `🔍 Check Live Status`, callback_data: `check:${clean}` },
@@ -1145,6 +1273,19 @@ function resolveLocalMediaPath(item, defaultUser = '') {
     for (const sub of subdirs) {
       const p = path.join(config.DOWNLOADS_DIR, defaultUser, sub, item.fileName);
       if (fs.existsSync(p)) return p;
+    }
+    // Also check nested subfolders under highlights
+    const hlRoot = path.join(config.DOWNLOADS_DIR, defaultUser, 'highlights');
+    if (fs.existsSync(hlRoot)) {
+      try {
+        const subfolders = fs.readdirSync(hlRoot, { withFileTypes: true });
+        for (const sf of subfolders) {
+          if (sf.isDirectory()) {
+            const nested = path.join(hlRoot, sf.name, item.fileName);
+            if (fs.existsSync(nested)) return nested;
+          }
+        }
+      } catch (e) {}
     }
   }
   return null;

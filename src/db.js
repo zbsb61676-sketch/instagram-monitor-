@@ -277,9 +277,14 @@ class Database {
     const record = {
       id: String(mediaItem.id || mediaItem.code),
       code: mediaItem.code || '',
-      type: mediaItem.type || 'photo', // photo, video, story, profile_pic
+      type: mediaItem.type || 'photo', // photo, video, story, profile_pic, highlight_video, highlight_photo
       fileName: mediaItem.fileName || '',
+      filePath: mediaItem.filePath || '',
       fileUrl: mediaItem.fileUrl || '',
+      thumbnailUrl: mediaItem.thumbnailUrl || mediaItem.fileUrl || '',
+      thumbnailPath: mediaItem.thumbnailPath || mediaItem.filePath || '',
+      highlightId: mediaItem.highlightId || '',
+      highlightTitle: mediaItem.highlightTitle || '',
       caption: mediaItem.caption || '',
       downloadedAt: new Date().toISOString()
     };

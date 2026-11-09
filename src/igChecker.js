@@ -1,7 +1,14 @@
+require('./dnsPatch');
+
 /**
  * Instagram Profile Privacy Checker
  * Checks whether an Instagram handle is Public, Private, Not Found, or Rate-limited.
  */
+
+const dns = require('dns');
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const proxyManager = require('./proxyManager');
 
