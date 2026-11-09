@@ -18,7 +18,7 @@ const ipv4Agent = new https.Agent({
 });
 
 /**
- * Base HTTP request over pure IPv4
+ * Base HTTP request over pure IPv4 with automatic retry on 429 & transient network drops
  */
 function request(options, postBuffer = null, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
@@ -71,13 +71,38 @@ function request(options, postBuffer = null, timeoutMs = 20000) {
 }
 
 /**
+ * Executes request with automatic 429 rate limit backoff and transient error retries
+ */
+async function requestWithRetry(options, postBuffer = null, timeoutMs = 20000, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await request(options, postBuffer, timeoutMs);
+      if (res.statusCode === 429 && attempt < maxRetries) {
+        const retrySec = res.data?.parameters?.retry_after || 3;
+        console.warn(`[TelegramClient] Rate limited (429). Backing off for ${retrySec}s... (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, (retrySec * 1000) + 500));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      if (attempt < maxRetries && (err.message?.includes('timed out') || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT')) {
+        console.warn(`[TelegramClient] Transient socket error (${err.message}), retrying in 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
  * Post JSON payload to Telegram API
  */
 async function postJson(token, method, payload, timeoutMs = 20000) {
   const jsonStr = JSON.stringify(payload);
   const buffer = Buffer.from(jsonStr, 'utf-8');
 
-  return request({
+  return requestWithRetry({
     method: 'POST',
     path: `/bot${token}/${method}`,
     headers: {
@@ -94,7 +119,7 @@ async function getJson(token, method, queryParams = {}, timeoutMs = 35000) {
   const query = new URLSearchParams(queryParams).toString();
   const pathWithQuery = `/bot${token}/${method}${query ? '?' + query : ''}`;
 
-  return request({
+  return requestWithRetry({
     method: 'GET',
     path: pathWithQuery
   }, null, timeoutMs);
@@ -160,7 +185,7 @@ function buildMultipart(fields, files) {
 async function postMultipart(token, method, fields, files, timeoutMs = 35000) {
   const { buffer, contentType } = buildMultipart(fields, files);
 
-  return request({
+  return requestWithRetry({
     method: 'POST',
     path: `/bot${token}/${method}`,
     headers: {
@@ -214,21 +239,38 @@ async function sendPhoto(token, chatId, photoSource, caption = '', options = {})
 }
 
 /**
- * Send a single video (remote URL or local filePath)
+ * Send a single video (remote URL or local filePath) with auto-scaling timeout and document fallback
  */
 async function sendVideo(token, chatId, videoSource, caption = '', options = {}) {
   const isLocalFile = typeof videoSource === 'string' && fs.existsSync(videoSource);
 
   if (isLocalFile) {
+    let timeout = 120000;
+    try {
+      const sz = fs.statSync(videoSource).size;
+      // Allow ample time for large video files over slower connections (min 90s, up to 240s)
+      timeout = Math.max(90000, Math.min(240000, Math.ceil(sz / (50 * 1024)) * 1000));
+    } catch (e) {}
+
     const fields = {
       chat_id: String(chatId),
       caption,
       parse_mode: 'HTML',
       ...options
     };
-    return postMultipart(token, 'sendVideo', fields, {
-      video: { path: videoSource }
-    }, 45000);
+
+    try {
+      const res = await postMultipart(token, 'sendVideo', fields, {
+        video: { path: videoSource }
+      }, timeout);
+      if (res.ok) return res;
+      // If sendVideo rejected by Telegram, fallback to sendDocument
+      console.warn(`[TelegramClient] sendVideo returned not ok (${res.data?.description}), falling back to sendDocument...`);
+      return sendDocument(token, chatId, videoSource, caption, options);
+    } catch (e) {
+      console.warn(`[TelegramClient] sendVideo failed (${e.message}), falling back to sendDocument...`);
+      return sendDocument(token, chatId, videoSource, caption, options);
+    }
   } else {
     const payload = {
       chat_id: chatId,
@@ -248,6 +290,12 @@ async function sendDocument(token, chatId, documentSource, caption = '', options
   const isLocalFile = typeof documentSource === 'string' && fs.existsSync(documentSource);
 
   if (isLocalFile) {
+    let timeout = 120000;
+    try {
+      const sz = fs.statSync(documentSource).size;
+      timeout = Math.max(90000, Math.min(300000, Math.ceil(sz / (50 * 1024)) * 1000));
+    } catch (e) {}
+
     const fields = {
       chat_id: String(chatId),
       caption,
@@ -256,7 +304,7 @@ async function sendDocument(token, chatId, documentSource, caption = '', options
     };
     return postMultipart(token, 'sendDocument', fields, {
       document: { path: documentSource }
-    }, 60000);
+    }, timeout);
   } else {
     const payload = {
       chat_id: chatId,

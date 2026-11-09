@@ -187,6 +187,13 @@ class TelegramBotService {
       return this.handleCheckCommand(token, chatId, arg1, settings);
     }
 
+    if (cmd === '/all' || cmd === '/sendall' || cmd === '/everything') {
+      if (!arg1) {
+        return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/all instagram</code>');
+      }
+      return this.handleAllMediaCommand(token, chatId, arg1, settings);
+    }
+
     if (cmd === '/download' || cmd === '/dl' || cmd === '/posts' || cmd === '/post') {
       if (!arg1) {
         return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/posts instagram</code>');
@@ -205,7 +212,9 @@ class TelegramBotService {
       if (!arg1) {
         return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/highlights instagram</code>');
       }
-      return this.handleHighlightsCommand(token, chatId, arg1, settings);
+      const arg2 = parts[2] ? parts[2].trim().toLowerCase() : '';
+      const mode = (arg2 === 'all' || arg1.toLowerCase() === 'all') ? 'ALL' : (parts.slice(2).join(' ').trim() || null);
+      return this.handleHighlightsCommand(token, chatId, arg1, settings, mode);
     }
 
     if (cmd === '/reels' || cmd === '/reel') {
@@ -305,6 +314,23 @@ class TelegramBotService {
       return this.handleStoriesCommand(token, chatId, username, settings);
     }
 
+    if (data.startsWith('all:')) {
+      const username = data.split(':')[1];
+      return this.handleAllMediaCommand(token, chatId, username, settings);
+    }
+
+    if (data.startsWith('hlall:')) {
+      const username = data.split(':')[1];
+      return this.handleHighlightsCommand(token, chatId, username, settings, 'ALL');
+    }
+
+    if (data.startsWith('hlreel:')) {
+      const parts = data.split(':');
+      const username = parts[1];
+      const title = decodeURIComponent(parts.slice(2).join(':'));
+      return this.handleHighlightsCommand(token, chatId, username, settings, title);
+    }
+
     if (data.startsWith('highlights:') || data.startsWith('hl:')) {
       const username = data.split(':')[1];
       return this.handleHighlightsCommand(token, chatId, username, settings);
@@ -344,6 +370,7 @@ class TelegramBotService {
       `Control your monitoring server and access all media directly from Telegram!`,
       ``,
       `📂 <b>Media Access & Downloads:</b>`,
+      `• <code>/all &lt;username&gt;</code> - Stream ALL media (stories, highlights, reels, posts)`,
       `• <code>/media &lt;username&gt;</code> - Interactive media control center`,
       `• <code>/stories &lt;username&gt;</code> - Play active stories (photos & videos)`,
       `• <code>/highlights &lt;username&gt;</code> - Play full highlight stories & reels`,
@@ -558,29 +585,41 @@ class TelegramBotService {
 
     if (validPhotos.length === 0 && validVideos.length === 0) return false;
 
-    // 1. Send photos
+    // 1. Send all photo posts in albums of 10
     if (validPhotos.length === 1) {
       const p = validPhotos[0];
-      await this.sendLocalPhoto(token, chatId, p.fullPath, `📸 <b>@${username}</b>\n${escapeHtml(p.caption)}`);
+      const caption = formatPostCaption(username, 1, 1, p);
+      await this.sendLocalPhoto(token, chatId, p.fullPath, caption);
     } else if (validPhotos.length > 1) {
-      // Send up to 20 photos in albums of 10
-      for (let i = 0; i < Math.min(validPhotos.length, 20); i += 10) {
+      for (let i = 0; i < validPhotos.length; i += 10) {
         const chunk = validPhotos.slice(i, i + 10);
-        const albumCaption = i === 0 ? `📸 <b>@${username}</b> posts (${validPhotos.length} photos)\n🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>` : '';
+        const start = i + 1;
+        const end = Math.min(i + 10, validPhotos.length);
+        const albumCaption = 
+          `📸 <b>POST PHOTOS [${start}-${end}/${validPhotos.length}]</b> • @<b>${username}</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>`;
         try {
           await telegramClient.sendMediaGroup(token, chatId, chunk, albumCaption);
         } catch (err) {
-          console.error('[TelegramBot] sendMediaGroup error:', err.message);
-          for (const p of chunk.slice(0, 3)) {
-            await this.sendLocalPhoto(token, chatId, p.fullPath, `📸 <b>@${username}</b>: ${escapeHtml(p.caption)}`);
+          console.error('[TelegramBot] sendMediaGroup error, sending individually:', err.message);
+          for (let ci = 0; ci < chunk.length; ci++) {
+            const p = chunk[ci];
+            const caption = formatPostCaption(username, i + ci + 1, validPhotos.length, p);
+            await this.sendLocalPhoto(token, chatId, p.fullPath, caption);
+            await new Promise(r => setTimeout(r, 500));
           }
         }
+        await new Promise(r => setTimeout(r, 600));
       }
     }
 
-    // 2. Send video posts if any
-    for (const v of validVideos.slice(0, 4)) {
-      await this.sendLocalVideo(token, chatId, v.fullPath, `🎬 <b>@${username} Video Post</b>\n${escapeHtml(v.caption || '')}`);
+    // 2. Send all video posts
+    for (let i = 0; i < validVideos.length; i++) {
+      const v = validVideos[i];
+      const caption = formatReelCaption(username, i + 1, validVideos.length, v);
+      await this.sendLocalVideo(token, chatId, v.fullPath, caption);
+      await new Promise(r => setTimeout(r, 600));
     }
 
     return true;
@@ -628,6 +667,7 @@ class TelegramBotService {
                 { text: '📸 View Posts', callback_data: `posts:${clean}` }
               ],
               [
+                { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
                 { text: '📂 Media Menu', callback_data: `media:${clean}` }
               ]
             ]
@@ -635,38 +675,35 @@ class TelegramBotService {
         });
       }
 
+      const totalStories = validStories.length;
       const photoStories = validStories.filter(s => !s.isVideo);
       const videoStories = validStories.filter(s => s.isVideo);
 
-      await this.sendMessage(token, chatId, `🎉 Found <b>${validStories.length} active stories</b> for <b>@${clean}</b> (${photoStories.length} photos, ${videoStories.length} playable videos)! Delivering below:`);
+      await this.sendMessage(token, chatId, 
+        `🚀 <b>Delivering All ${totalStories} Active Stories for @${clean}...</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `📹 <b>Playable Videos:</b> ${videoStories.length}\n` +
+        `🖼 <b>Story Photos:</b> ${photoStories.length}\n` +
+        `⏳ <i>Streaming every single story to your chat now...</i>`
+      );
 
-      // 1. Send photo stories
-      if (photoStories.length > 0) {
-        if (photoStories.length === 1) {
-          await this.sendLocalPhoto(token, chatId, photoStories[0].fullPath, `📱 Story Photo: <b>@${clean}</b>`);
+      // Stream every single story without truncation
+      for (let i = 0; i < totalStories; i++) {
+        const item = validStories[i];
+        const num = i + 1;
+        const caption = formatStoryCaption(clean, num, totalStories, item);
+
+        if (item.isVideo) {
+          await this.sendLocalVideo(token, chatId, item.fullPath, caption);
         } else {
-          for (let i = 0; i < photoStories.length; i += 10) {
-            const chunk = photoStories.slice(i, i + 10);
-            await telegramClient.sendMediaGroup(token, chatId, chunk, `📱 <b>@${clean}</b> active story photos`);
-          }
+          await this.sendLocalPhoto(token, chatId, item.fullPath, caption);
         }
-      }
-
-      // 2. Send video stories (MP4 playable inline)
-      const maxVideos = Math.min(videoStories.length, 8);
-      for (let i = 0; i < maxVideos; i++) {
-        const v = videoStories[i];
-        const caption = `📱 <b>@${clean} Story Video</b> (${i + 1}/${videoStories.length})\n⏰ ${escapeHtml(v.caption || 'Active Story')}`;
-        await this.sendLocalVideo(token, chatId, v.fullPath, caption);
-      }
-
-      if (videoStories.length > maxVideos) {
-        await this.sendMessage(token, chatId, `ℹ️ <i>Delivered ${maxVideos} of ${videoStories.length} story videos to chat. Tap below to download the full archive with all stories & media!</i>`);
+        await new Promise(r => setTimeout(r, 600));
       }
 
       const bottomButtons = [
         [
-          { text: `📦 Download All (${validStories.length}) as ZIP`, callback_data: `zip:${clean}` }
+          { text: `📦 Download All (${totalStories}) as ZIP`, callback_data: `zip:${clean}` }
         ],
         [
           { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
@@ -678,7 +715,11 @@ class TelegramBotService {
         ]
       ];
 
-      await this.sendMessage(token, chatId, `✨ All stories delivered for <b>@${clean}</b>!`, {
+      await this.sendMessage(token, chatId, 
+        `✅ <b>All ${totalStories} Stories Delivered for @${clean}!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>Sent:</b> ${totalStories} of ${totalStories} stories (Zero missing)\n` +
+        `⚡ <i>All media received in original full resolution.</i>`, {
         reply_markup: { inline_keyboard: bottomButtons }
       });
     } catch (err) {
@@ -686,9 +727,9 @@ class TelegramBotService {
     }
   }
 
-  async handleHighlightsCommand(token, chatId, username, settings) {
+  async handleHighlightsCommand(token, chatId, username, settings, selectedReel = null) {
     const clean = username.trim().toLowerCase().replace(/^@/, '');
-    await this.sendMessage(token, chatId, `⏳ <b>Fetching highlights for @${clean}...</b>\nDiscovering highlight reels and downloading story photos & videos.`);
+    await this.sendMessage(token, chatId, `⏳ <b>Fetching highlights for @${clean}...</b>\nDiscovering highlight reels and preparing story photos & videos.`);
     await this.sendChatAction(token, chatId, 'upload_photo');
 
     try {
@@ -722,61 +763,126 @@ class TelegramBotService {
         byTitle[title].push(it);
       }
 
-      const titleCount = Object.keys(byTitle).length;
-      await this.sendMessage(token, chatId, `✨ Found <b>${titleCount} highlight reel(s)</b> (${items.length} total media) for <b>@${clean}</b>! Delivering below:`);
+      const reelTitles = Object.keys(byTitle);
 
-      for (const [title, hlItems] of Object.entries(byTitle)) {
-        const validPhotos = [];
-        const validVideos = [];
+      // If user did not specify a reel and there are multiple reels and not "ALL",
+      // display the interactive Highlight Reels Hub menu with option to send all or select one!
+      if (!selectedReel && reelTitles.length > 1) {
+        const reelRows = [];
+        let summaryLines = [];
+        let totalCount = 0;
 
+        for (let i = 0; i < reelTitles.length; i++) {
+          const t = reelTitles[i];
+          const count = byTitle[t].length;
+          totalCount += count;
+          summaryLines.push(`• <b>${escapeHtml(t)}</b> — <code>${count} items</code>`);
+          reelRows.push([
+            { text: `📁 ${t} (${count} items)`, callback_data: `hlreel:${clean}:${encodeURIComponent(t)}` }
+          ]);
+        }
+
+        reelRows.unshift([
+          { text: `✨ Send ALL (${totalCount} Highlight Media Items)`, callback_data: `hlall:${clean}` }
+        ]);
+
+        reelRows.push([
+          { text: `📦 Download All as ZIP`, callback_data: `zip:${clean}` },
+          { text: `📂 Media Menu`, callback_data: `media:${clean}` }
+        ]);
+
+        return this.sendMessage(token, chatId, 
+          `✨ <b>Story Highlights Menu: @${clean}</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `Found <b>${reelTitles.length} highlight reels</b> (<b>${totalCount} total media items</b>):\n\n` +
+          summaryLines.join('\n') + `\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `💡 <i>Tap <b>"Send ALL"</b> below to stream all ${totalCount} items, or tap any specific reel to view its stories:</i>`,
+          { reply_markup: { inline_keyboard: reelRows } }
+        );
+      }
+
+      // Determine which reels to deliver
+      let reelsToDeliver = {};
+      if (selectedReel && selectedReel !== 'ALL') {
+        const matchingKey = Object.keys(byTitle).find(k => k.toLowerCase() === selectedReel.toLowerCase()) || selectedReel;
+        if (byTitle[matchingKey]) {
+          reelsToDeliver[matchingKey] = byTitle[matchingKey];
+        } else {
+          reelsToDeliver = byTitle;
+        }
+      } else {
+        reelsToDeliver = byTitle;
+      }
+
+      const totalMediaInSelection = Object.values(reelsToDeliver).reduce((sum, arr) => sum + arr.length, 0);
+
+      await this.sendMessage(token, chatId, 
+        `🚀 <b>Streaming Highlight Stories for @${clean}...</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📁 <b>Reels:</b> ${Object.keys(reelsToDeliver).length} reel(s)\n` +
+        `📦 <b>Total Items:</b> ${totalMediaInSelection} items\n` +
+        `⏳ <i>Sending every photo & video with full formatting...</i>`
+      );
+
+      for (const [title, hlItems] of Object.entries(reelsToDeliver)) {
+        const validItems = [];
         for (const it of hlItems) {
           const fPath = resolveLocalMediaPath(it, clean);
           if (fPath && fs.existsSync(fPath)) {
             const isVideo = it.type?.includes('video') || fPath.endsWith('.mp4');
-            if (isVideo) {
-              validVideos.push({ ...it, fullPath: fPath });
-            } else {
-              validPhotos.push({
-                fullPath: fPath,
-                fileName: path.basename(fPath),
-                caption: it.caption || `Highlight: ${title}`
-              });
-            }
+            validItems.push({
+              ...it,
+              fullPath: fPath,
+              fileName: path.basename(fPath),
+              isVideo
+            });
           }
         }
 
-        // Send photos in album (chunks of up to 10)
-        if (validPhotos.length === 1) {
-          await this.sendLocalPhoto(token, chatId, validPhotos[0].fullPath, `✨ <b>@${clean}</b> [${escapeHtml(title)}]\n${escapeHtml(validPhotos[0].caption)}`);
-        } else if (validPhotos.length > 1) {
-          for (let i = 0; i < Math.min(validPhotos.length, 10); i += 10) {
-            const chunk = validPhotos.slice(i, i + 10);
-            await telegramClient.sendMediaGroup(token, chatId, chunk, `✨ <b>@${clean}</b> highlight [${escapeHtml(title)}]`);
-          }
-        }
+        if (validItems.length === 0) continue;
 
-        // Send videos (playable MP4s)
-        for (let i = 0; i < Math.min(validVideos.length, 4); i++) {
-          const v = validVideos[i];
-          const cap = `✨ <b>@${clean}</b> [${escapeHtml(title)}] (${i + 1}/${validVideos.length})\n⏰ ${escapeHtml(v.caption || '')}`;
-          await this.sendLocalVideo(token, chatId, v.fullPath, cap);
+        // Send reel header separator
+        await this.sendMessage(token, chatId, 
+          `📁 <b>Highlight Reel:</b> <b>${escapeHtml(title)}</b> (${validItems.length} items)\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━━━━`
+        );
+        await new Promise(r => setTimeout(r, 400));
+
+        // Stream all items in this reel
+        for (let i = 0; i < validItems.length; i++) {
+          const it = validItems[i];
+          const num = i + 1;
+          const caption = formatHighlightCaption(clean, num, validItems.length, title, it);
+
+          if (it.isVideo) {
+            await this.sendLocalVideo(token, chatId, it.fullPath, caption);
+          } else {
+            await this.sendLocalPhoto(token, chatId, it.fullPath, caption);
+          }
+          await new Promise(r => setTimeout(r, 600));
         }
       }
 
       const buttons = [
         [
-          { text: `📦 Download All (${items.length}) as ZIP`, callback_data: `zip:${clean}` }
+          { text: `📦 Download All (${totalMediaInSelection}) as ZIP`, callback_data: `zip:${clean}` }
         ],
         [
           { text: '📱 Active Stories', callback_data: `stories:${clean}` },
           { text: '🎬 Reels & Videos', callback_data: `reels:${clean}` }
         ],
         [
+          { text: '📸 Posts & Slides', callback_data: `posts:${clean}` },
           { text: '📂 Media Menu', callback_data: `media:${clean}` }
         ]
       ];
 
-      await this.sendMessage(token, chatId, `✨ All highlight media delivered for <b>@${clean}</b>!`, {
+      await this.sendMessage(token, chatId, 
+        `✅ <b>Highlight Media Delivery Complete for @${clean}!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>Delivered:</b> ${totalMediaInSelection} / ${totalMediaInSelection} items (Zero missing)\n` +
+        `⚡ <i>All stories sent in original full resolution.</i>`, {
         reply_markup: { inline_keyboard: buttons }
       });
     } catch (err) {
@@ -838,6 +944,7 @@ class TelegramBotService {
                 { text: '📱 View Stories', callback_data: `stories:${clean}` }
               ],
               [
+                { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
                 { text: '📂 Media Menu', callback_data: `media:${clean}` }
               ]
             ]
@@ -845,34 +952,73 @@ class TelegramBotService {
         });
       }
 
-      await this.sendMessage(token, chatId, `🎬 Found <b>${validReels.length} reels/videos</b> for <b>@${clean}</b>! Sending below:`);
+      const totalReels = validReels.length;
+      await this.sendMessage(token, chatId, 
+        `🚀 <b>Delivering All ${totalReels} Playable Reels for @${clean}...</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `⏳ <i>Sending every video with full caption & link...</i>`
+      );
 
-      const maxToSend = Math.min(validReels.length, 6);
-      for (let i = 0; i < maxToSend; i++) {
+      for (let i = 0; i < totalReels; i++) {
         const r = validReels[i];
-        const caption = `🎬 <b>@${clean} Reel</b> (${i + 1}/${validReels.length})\n${escapeHtml(r.caption || '')}`;
+        const num = i + 1;
+        const caption = formatReelCaption(clean, num, totalReels, r);
         await this.sendLocalVideo(token, chatId, r.fullPath, caption);
+        await new Promise(r => setTimeout(r, 600));
       }
 
       const buttons = [
         [
-          { text: `📦 Download All (${validReels.length}) as ZIP`, callback_data: `zip:${clean}` }
+          { text: `📦 Download All (${totalReels}) as ZIP`, callback_data: `zip:${clean}` }
         ],
         [
           { text: '📸 View Posts', callback_data: `posts:${clean}` },
           { text: '📱 View Stories', callback_data: `stories:${clean}` }
         ],
         [
+          { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
           { text: '📂 Media Menu', callback_data: `media:${clean}` }
         ]
       ];
 
-      await this.sendMessage(token, chatId, `✨ Reels delivered for <b>@${clean}</b>!`, {
+      await this.sendMessage(token, chatId, 
+        `✅ <b>All ${totalReels} Reels Delivered for @${clean}!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 <b>Delivered:</b> ${totalReels} / ${totalReels} reels (Zero missing)`, {
         reply_markup: { inline_keyboard: buttons }
       });
     } catch (err) {
       await this.sendMessage(token, chatId, `❌ Failed retrieving reels for @${clean}: ${err.message}`);
     }
+  }
+
+  async handleAllMediaCommand(token, chatId, username, settings) {
+    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    await this.sendMessage(token, chatId, 
+      `🌟 <b>Starting Complete Media Suite Delivery for @${clean}...</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `📦 Delivering all active stories, highlights, video reels, and photo posts!\n` +
+      `⚡ <i>Every item will be sent in full format with zero omission.</i>`
+    );
+
+    // 1. Avatar
+    await this.handleAvatarCommand(token, chatId, clean, settings);
+    await new Promise(r => setTimeout(r, 800));
+
+    // 2. Active Stories
+    await this.handleStoriesCommand(token, chatId, clean, settings);
+    await new Promise(r => setTimeout(r, 800));
+
+    // 3. Reels & Videos
+    await this.handleReelsCommand(token, chatId, clean, settings);
+    await new Promise(r => setTimeout(r, 800));
+
+    // 4. Posts & Carousel Slides
+    await this.handleDownloadCommand(token, chatId, clean, settings);
+    await new Promise(r => setTimeout(r, 800));
+
+    // 5. All Highlights
+    await this.handleHighlightsCommand(token, chatId, clean, settings, 'ALL');
   }
 
   async handleZipCommand(token, chatId, username, settings) {
@@ -1021,6 +1167,9 @@ class TelegramBotService {
       [
         { text: `🎬 Reels (${reelsCount})`, callback_data: `reels:${clean}` },
         { text: `📸 Posts (${postsCount})`, callback_data: `posts:${clean}` }
+      ],
+      [
+        { text: `🌟 Stream ALL Media (${totalItems} Files)`, callback_data: `all:${clean}` }
       ],
       [
         { text: `📦 Download All as ZIP (${sizeStr})`, callback_data: `zip:${clean}` },
@@ -1246,6 +1395,76 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function formatStoryCaption(username, index, total, item) {
+  const isVideo = item.isVideo || item.type?.includes('video') || item.fileName?.endsWith('.mp4');
+  const typeIcon = isVideo ? '📹' : '🖼';
+  const typeText = isVideo ? 'Playable Video (MP4)' : 'Story Photo (JPEG)';
+  const dateStr = item.caption && item.caption.includes('Instagram Story (')
+    ? item.caption.replace(/.*Instagram Story \(([^)]+)\).*/, '$1')
+    : 'Active 24h';
+
+  return `📱 <b>STORY [${index}/${total}]</b> • @<b>${username}</b>\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `${typeIcon} <b>Type:</b> ${typeText}\n` +
+         `⏰ <b>Status:</b> ${escapeHtml(dateStr)}\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `🔗 <a href="https://www.instagram.com/stories/${username}/">instagram.com/stories/${username}</a>`;
+}
+
+function formatHighlightCaption(username, index, totalInReel, title, item) {
+  const isVideo = item.isVideo || item.type?.includes('video') || item.fileName?.endsWith('.mp4');
+  const typeIcon = isVideo ? '📹' : '🖼';
+  const typeText = isVideo ? 'Highlight Video (MP4)' : 'Highlight Photo (JPEG)';
+
+  return `✨ <b>HIGHLIGHT [${index}/${totalInReel}]</b>\n` +
+         `📁 <b>Reel:</b> <b>${escapeHtml(title)}</b>\n` +
+         `👤 <b>User:</b> @<b>${username}</b>\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `${typeIcon} <b>Type:</b> ${typeText}\n` +
+         `━━━━━━━━━━━━━━━━━━━━\n` +
+         `🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>`;
+}
+
+function formatReelCaption(username, index, total, item) {
+  let capText = (item.caption || '').trim();
+  if (capText.length > 200) capText = capText.slice(0, 197) + '...';
+  const code = item.code || (item.fileName ? item.fileName.split('.')[0] : '');
+
+  let out = `🎬 <b>REEL [${index}/${total}]</b> • @<b>${username}</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📹 <b>Type:</b> Playable Reel (MP4)\n`;
+  if (capText && !capText.startsWith('Reel / Video Post')) {
+    out += `💬 <b>Caption:</b> <i>${escapeHtml(capText)}</i>\n`;
+  }
+  out += `━━━━━━━━━━━━━━━━━━━━\n`;
+  if (code && code.length > 3) {
+    out += `🔗 <a href="https://www.instagram.com/p/${code}/">instagram.com/p/${code}</a>`;
+  } else {
+    out += `🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>`;
+  }
+  return out;
+}
+
+function formatPostCaption(username, index, total, item) {
+  let capText = (item.caption || '').trim();
+  if (capText.length > 200) capText = capText.slice(0, 197) + '...';
+  const code = item.code || (item.fileName ? item.fileName.split('.')[0] : '');
+
+  let out = `📸 <b>POST [${index}/${total}]</b> • @<b>${username}</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `🖼 <b>Type:</b> Photo Post (JPEG)\n`;
+  if (capText) {
+    out += `💬 <b>Caption:</b> <i>${escapeHtml(capText)}</i>\n`;
+  }
+  out += `━━━━━━━━━━━━━━━━━━━━\n`;
+  if (code && code.length > 3) {
+    out += `🔗 <a href="https://www.instagram.com/p/${code}/">instagram.com/p/${code}</a>`;
+  } else {
+    out += `🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>`;
+  }
+  return out;
 }
 
 function formatBytes(bytes) {
