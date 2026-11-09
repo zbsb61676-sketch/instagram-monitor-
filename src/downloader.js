@@ -660,7 +660,8 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
  */
 async function downloadActiveStories(username, userId, storiesDir, options, onProgress = null) {
   const result = { newlyDownloaded: 0, skipped: 0, items: [] };
-  if (!options.sessionCookie || !username) return result;
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!options.sessionCookie || !clean) return result;
 
   const isCache = options.isCache === true;
   const urlPrefix = isCache ? '/cache' : '/downloads';
@@ -871,8 +872,89 @@ async function downloadActiveStories(username, userId, storiesDir, options, onPr
   return result;
 }
 
+/**
+ * Standalone story fetcher used by Telegram bot & API
+ * Fetches active stories for a user, downloads them, and returns an array of media objects.
+ */
+async function fetchActiveStories(username, options = {}) {
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!clean) return { items: [] };
+
+  const isCache = options.isCache === true;
+  const rootDir = isCache ? config.CACHE_DIR : config.DOWNLOADS_DIR;
+  const storiesDir = path.join(rootDir, clean, 'stories');
+  if (!fs.existsSync(storiesDir)) {
+    fs.mkdirSync(storiesDir, { recursive: true });
+  }
+
+  const settings = db.getSettings();
+  const sessionCookie = options.sessionCookie || settings.sessionCookie;
+
+  let userId = null;
+  const target = db.getTarget(clean);
+  if (target?.profileInfo?.userId) {
+    userId = target.profileInfo.userId;
+  }
+
+  if (!userId) {
+    try {
+      const profileUrl = `https://www.instagram.com/${clean}/`;
+      const res = await fetch(profileUrl, {
+        headers: getBrowserHeaders(),
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.ok) {
+        const html = await res.text();
+        const details = extractProfileDetails(html, clean);
+        if (details.userId) userId = details.userId;
+      }
+    } catch (e) {}
+  }
+
+  let result = { newlyDownloaded: 0, skipped: 0, items: [] };
+
+  if (sessionCookie) {
+    result = await downloadActiveStories(clean, userId, storiesDir, { ...options, sessionCookie });
+  }
+
+  // Fallback: If no new items downloaded or session cookie not configured,
+  // return existing stories on disk from database or directory
+  if (result.items.length === 0) {
+    const downloaded = db.getDownloadedMedia(clean).filter(m => m.type?.includes('story'));
+    if (downloaded.length > 0) {
+      result.items = downloaded.map(item => {
+        let fullPath = item.filePath;
+        if (!fullPath && item.fileUrl) {
+          const rel = item.fileUrl.replace(/^\/downloads\//, '');
+          fullPath = path.join(config.DOWNLOADS_DIR, rel);
+        }
+        return { ...item, filePath: fullPath };
+      }).filter(item => item.filePath && fs.existsSync(item.filePath));
+    } else if (fs.existsSync(storiesDir)) {
+      const files = fs.readdirSync(storiesDir).filter(f => !f.includes('_thumb') && (f.endsWith('.jpg') || f.endsWith('.mp4')));
+      result.items = files.map(f => {
+        const isVideo = f.endsWith('.mp4');
+        const rawId = f.split('.')[0];
+        const filePath = path.join(storiesDir, f);
+        return {
+          id: `story_${rawId}`,
+          code: rawId,
+          type: isVideo ? 'story_video' : 'story',
+          fileName: f,
+          filePath,
+          fileUrl: `/downloads/${clean}/stories/${f}`,
+          caption: `Instagram Story (${new Date(fs.statSync(filePath).mtimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`
+        };
+      });
+    }
+  }
+
+  return result;
+}
+
 module.exports = {
   downloadTargetContent,
   downloadFile,
-  fetchPostSlides
+  fetchPostSlides,
+  fetchActiveStories
 };

@@ -47,8 +47,28 @@ async function sendTelegramAlert({ username, previousStatus, currentStatus, prof
     `🔗 <a href="${profileUrl}">Open Profile: instagram.com/${username}</a>`
   ].join('\n');
 
+  const buttons = isNowPrivate
+    ? [
+        [
+          { text: '🔍 Check Profile', callback_data: `check:${username}` },
+          { text: '📂 View Media', callback_data: `media:${username}` }
+        ]
+      ]
+    : [
+        [
+          { text: '📱 View Stories', callback_data: `stories:${username}` },
+          { text: '🎬 View Reels', callback_data: `reels:${username}` }
+        ],
+        [
+          { text: '📸 Download Posts', callback_data: `dl:${username}` },
+          { text: '📦 Full ZIP Archive', callback_data: `zip:${username}` }
+        ]
+      ];
+
   try {
-    const res = await telegramClient.sendMessage(token, chatId, message);
+    const res = await telegramClient.sendMessage(token, chatId, message, {
+      reply_markup: { inline_keyboard: buttons }
+    });
     if (!res.ok) {
       throw new Error(res.data?.description || `HTTP ${res.statusCode}`);
     }

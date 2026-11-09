@@ -217,7 +217,7 @@ async function sendPhoto(token, chatId, photoSource, caption = '', options = {})
  * Send a single video (remote URL or local filePath)
  */
 async function sendVideo(token, chatId, videoSource, caption = '', options = {}) {
-  const isLocalFile = typeof photoSource === 'string' && fs.existsSync(videoSource);
+  const isLocalFile = typeof videoSource === 'string' && fs.existsSync(videoSource);
 
   if (isLocalFile) {
     const fields = {
@@ -242,6 +242,34 @@ async function sendVideo(token, chatId, videoSource, caption = '', options = {})
 }
 
 /**
+ * Send a document/file (e.g. ZIP archive, audio, text)
+ */
+async function sendDocument(token, chatId, documentSource, caption = '', options = {}) {
+  const isLocalFile = typeof documentSource === 'string' && fs.existsSync(documentSource);
+
+  if (isLocalFile) {
+    const fields = {
+      chat_id: String(chatId),
+      caption,
+      parse_mode: 'HTML',
+      ...options
+    };
+    return postMultipart(token, 'sendDocument', fields, {
+      document: { path: documentSource }
+    }, 60000);
+  } else {
+    const payload = {
+      chat_id: chatId,
+      document: documentSource,
+      caption,
+      parse_mode: 'HTML',
+      ...options
+    };
+    return postJson(token, 'sendDocument', payload, 30000);
+  }
+}
+
+/**
  * Send media group (Photo / Video album)
  * Accepts array of items: { fullPath: string, caption: string, fileName?: string, type?: 'photo'|'video' }
  */
@@ -252,11 +280,12 @@ async function sendMediaGroup(token, chatId, items = [], mainCaption = '') {
   const valid = items.filter(it => it.fullPath && fs.existsSync(it.fullPath)).slice(0, 10);
   if (valid.length === 0) return { ok: false, description: 'No valid local files found' };
 
-  // If only 1 photo, send via sendPhoto
+  // If only 1 item, send via sendPhoto / sendVideo
   if (valid.length === 1) {
     const p = valid[0];
     const caption = mainCaption || p.caption || '';
-    return sendPhoto(token, chatId, p.fullPath, caption);
+    const isVideo = p.type === 'video' || (p.fileName && p.fileName.endsWith('.mp4'));
+    return isVideo ? sendVideo(token, chatId, p.fullPath, caption) : sendPhoto(token, chatId, p.fullPath, caption);
   }
 
   const mediaArray = [];
@@ -341,6 +370,7 @@ module.exports = {
   sendMessage,
   sendPhoto,
   sendVideo,
+  sendDocument,
   sendMediaGroup,
   sendChatAction,
   answerCallbackQuery,

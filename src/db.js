@@ -294,8 +294,11 @@ class Database {
   }
 
   getDownloadedMedia(username) {
-    const clean = username.toLowerCase().trim().replace(/^@/, '');
     if (!this.data.downloadedMedia) this.data.downloadedMedia = {};
+    if (!username) {
+      return Object.values(this.data.downloadedMedia).flat();
+    }
+    const clean = String(username).toLowerCase().trim().replace(/^@/, '');
     return this.data.downloadedMedia[clean] || [];
   }
 
