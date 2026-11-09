@@ -151,7 +151,7 @@ function extractMediaObjects(obj, collected = []) {
  * Extract user ID and profile info from HTML
  */
 function extractProfileDetails(html, targetUsername = '') {
-  const clean = (targetUsername || '').trim().toLowerCase().replace(/^@/, '');
+  const clean = (targetUsername || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
   let userId = null;
   let avatarUrl = null;
   let fullName = '';
@@ -367,7 +367,8 @@ async function downloadSingleHighlight(username, highlight, highlightsDir, optio
  * @param {function} onProgress - Optional callback for live item-by-item progress
  */
 async function downloadTargetContent(username, options = {}, onProgress = null) {
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!clean) return { totalCount: 0, downloadedItems: [] };
   const isCache = options.isCache === true;
   const rootDir = isCache ? config.CACHE_DIR : config.DOWNLOADS_DIR;
   const urlPrefix = isCache ? '/cache' : '/downloads';

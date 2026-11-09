@@ -252,11 +252,24 @@ class MonitorService {
     } finally {
       this.activeLocks.delete(targetId);
 
-      // Re-schedule next run based on intervalSec
+      // Re-schedule next run based on intervalSec with adaptive rate-limit backoff & jitter
       const latestTarget = db.getTarget(targetId);
       if (latestTarget && latestTarget.isMonitoring && this.isRunning) {
-        const intervalMs = Math.max(1000, (latestTarget.intervalSec || 3) * 1000);
-        this.scheduleTarget(latestTarget, intervalMs);
+        let intervalMs = Math.max(1000, (latestTarget.intervalSec || 3) * 1000);
+
+        // Adaptive Backoff on Instagram Rate-Limits to prevent prolonged IP bans
+        if (latestTarget.status === 'rate_limited') {
+          const errCount = latestTarget.consecutiveErrors || 1;
+          // Progressive backoff: 30s -> 60s -> 120s max
+          const backoffSec = Math.min(120, 30 * Math.pow(2, Math.min(errCount - 1, 2)));
+          intervalMs = backoffSec * 1000;
+        } else if (latestTarget.status === 'error' && (latestTarget.consecutiveErrors || 0) >= 3) {
+          intervalMs = Math.max(intervalMs, 10000); // 10s cooldown on persistent network errors
+        }
+
+        // Add small jitter (up to 500ms) to prevent multi-target thundering herd
+        const jitter = Math.floor(Math.random() * 500);
+        this.scheduleTarget(latestTarget, intervalMs + jitter);
       }
     }
   }

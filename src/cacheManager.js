@@ -14,6 +14,10 @@ if (!fs.existsSync(config.CACHE_DIR)) {
   fs.mkdirSync(config.CACHE_DIR, { recursive: true });
 }
 
+function cleanHandle(username) {
+  return (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+}
+
 class CacheManager {
   constructor() {
     this.cacheIndex = new Map(); // username -> Array<item>
@@ -25,11 +29,13 @@ class CacheManager {
       if (fs.existsSync(config.CACHE_DIR)) {
         const users = fs.readdirSync(config.CACHE_DIR);
         for (const u of users) {
-          const indexPath = path.join(config.CACHE_DIR, u, 'index.json');
+          const clean = cleanHandle(u);
+          if (!clean) continue;
+          const indexPath = path.join(config.CACHE_DIR, clean, 'index.json');
           if (fs.existsSync(indexPath)) {
             try {
               const data = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-              this.cacheIndex.set(u, data);
+              this.cacheIndex.set(clean, data);
             } catch (e) {}
           }
         }
@@ -38,7 +44,7 @@ class CacheManager {
   }
 
   getUserCacheDir(username) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     const userDir = path.join(config.CACHE_DIR, clean);
     ['posts', 'stories', 'highlights', 'profile'].forEach(sub => {
       const p = path.join(userDir, sub);
@@ -48,7 +54,7 @@ class CacheManager {
   }
 
   getCachedItems(username) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     const items = this.cacheIndex.get(clean) || [];
     // Verify files still exist on disk
     return items.filter(item => {
@@ -58,14 +64,14 @@ class CacheManager {
   }
 
   saveUserIndex(username, items) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     this.cacheIndex.set(clean, items);
     const userDir = this.getUserCacheDir(clean);
     fs.writeFileSync(path.join(userDir, 'index.json'), JSON.stringify(items, null, 2), 'utf8');
   }
 
   recordCachedItem(username, item) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     let items = this.getCachedItems(clean);
     const existingIdx = items.findIndex(i => i.id === item.id);
     if (existingIdx !== -1) {
@@ -78,7 +84,7 @@ class CacheManager {
   }
 
   deleteCachedItem(username, itemId) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     const items = this.getCachedItems(clean);
     const target = items.find(i => i.id === itemId);
     if (!target) return false;
@@ -102,7 +108,7 @@ class CacheManager {
   }
 
   clearUserCache(username) {
-    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    const clean = cleanHandle(username);
     const userDir = path.join(config.CACHE_DIR, clean);
     this.cacheIndex.delete(clean);
     if (fs.existsSync(userDir)) {

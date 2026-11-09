@@ -38,7 +38,10 @@ function decodeHtmlEntities(str) {
  * @returns {Promise<{ status: 'public'|'private'|'not_found'|'rate_limited'|'error', profileInfo: object, error?: string }>}
  */
 async function checkInstagramProfile(username, options = {}) {
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!clean) {
+    return { status: 'error', profileInfo: null, error: 'Invalid username format' };
+  }
   const url = `https://www.instagram.com/${clean}/`;
 
   const headers = {

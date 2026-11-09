@@ -30,6 +30,8 @@ const defaultState = {
 class Database {
   constructor() {
     this.filePath = config.DB_FILE;
+    this.saveTimer = null;
+    this.isDirty = false;
     this.data = this.load();
   }
 
@@ -59,16 +61,49 @@ class Database {
     } catch (err) {
       console.error('[DB] Failed to parse db.json, initializing fresh defaults:', err.message);
     }
-    this.save(defaultState);
+    this.flushSync(defaultState);
     return JSON.parse(JSON.stringify(defaultState));
   }
 
-  save(dataToSave = null) {
+  /**
+   * Save database with 500ms debouncing to minimize synchronous disk I/O.
+   * If immediate is true, writes immediately to disk.
+   */
+  save(dataToSave = null, immediate = false) {
+    if (dataToSave) {
+      this.data = dataToSave;
+    }
+    this.isDirty = true;
+
+    if (immediate) {
+      this.flushSync();
+      return;
+    }
+
+    if (!this.saveTimer) {
+      this.saveTimer = setTimeout(() => {
+        this.saveTimer = null;
+        if (this.isDirty) {
+          this.flushSync();
+        }
+      }, 500);
+    }
+  }
+
+  /**
+   * Atomic synchronous flush to disk
+   */
+  flushSync(dataToSave = null) {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
     try {
       const data = dataToSave || this.data;
       const tempPath = `${this.filePath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
       fs.renameSync(tempPath, this.filePath);
+      this.isDirty = false;
     } catch (err) {
       console.error('[DB] Failed to save database:', err.message);
     }

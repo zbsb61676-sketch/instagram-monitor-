@@ -43,7 +43,7 @@ class TelegramBotService {
     }
   }
 
-  start() {
+  async start() {
     const settings = db.getSettings();
     if (!settings.telegramToken) {
       console.log('[TelegramBot] No Telegram token configured in settings. Bot inactive.');
@@ -53,6 +53,18 @@ class TelegramBotService {
     if (this.isRunning) return;
     this.isRunning = true;
     console.log('[TelegramBot] Starting interactive Telegram bot long-polling engine...');
+
+    // Cold-start protection: acknowledge and skip stale commands sent during downtime
+    if (this.lastUpdateId === 0) {
+      try {
+        const warmup = await telegramClient.getJson(settings.telegramToken, 'getUpdates', { offset: -1, limit: 1 }, 10000);
+        if (warmup.ok && Array.isArray(warmup.data?.result) && warmup.data.result.length > 0) {
+          this.lastUpdateId = warmup.data.result[0].update_id;
+          console.log(`[TelegramBot] Synchronized update offset to ${this.lastUpdateId} (stale backlog skipped).`);
+        }
+      } catch (e) {}
+    }
+
     this.pollLoop();
   }
 

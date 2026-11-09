@@ -31,13 +31,18 @@ app.use('/cache', express.static(config.CACHE_DIR));
 // Clean up any stale cache from prior runs on boot
 cacheManager.clearAllCache();
 
+// Strict username sanitization preventing path traversal
+function cleanHandle(username) {
+  return (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+}
+
 // Active client tracking for session-based temporary cache lifecycle
 const activeClientSessions = new Map(); // ws -> Set<username>
 const userCleanupTimers = new Map(); // username -> NodeJS.Timeout
 
 function registerUserViewingCache(ws, username) {
-  if (!username) return;
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(username);
+  if (!clean) return;
   if (!activeClientSessions.has(ws)) {
     activeClientSessions.set(ws, new Set());
   }
@@ -51,7 +56,8 @@ function registerUserViewingCache(ws, username) {
 }
 
 function scheduleUserCacheCleanup(username, delayMs = 15000) {
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(username);
+  if (!clean) return;
   if (userCleanupTimers.has(clean)) {
     clearTimeout(userCleanupTimers.get(clean));
   }
@@ -103,8 +109,13 @@ db.addLog = function(message, level = 'info', username = null) {
   return logEntry;
 };
 
-// --- WebSocket Connection ---
+// --- WebSocket Connection with 30s Zombie Cleanup Heartbeat ---
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
   // Send initial state upon connection
   ws.send(JSON.stringify({
     type: 'INIT',
@@ -120,6 +131,7 @@ wss.on('connection', (ws) => {
     try {
       const parsed = JSON.parse(msg);
       if (parsed.type === 'PING') {
+        ws.isAlive = true;
         ws.send(JSON.stringify({ type: 'PONG' }));
       } else if (parsed.type === 'VIEWING_CACHE' && parsed.username) {
         registerUserViewingCache(ws, parsed.username);
@@ -139,6 +151,18 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+// Periodic heartbeat to terminate abandoned or zombie sockets
+const wsHeartbeatInterval = setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+    } else {
+      client.isAlive = false;
+      client.ping();
+    }
+  }
+}, 30000);
 
 // --- REST API Endpoints ---
 
@@ -396,7 +420,10 @@ app.post(['/api/cache/inspect', '/api/download-live'], async (req, res) => {
     return res.status(400).json({ error: 'Username is required' });
   }
 
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(username);
+  if (!clean) {
+    return res.status(400).json({ error: 'Invalid username format' });
+  }
   const settings = db.getSettings();
 
   // Clear previous cache for this user to ensure fresh, real-time data from Instagram
@@ -451,14 +478,14 @@ app.post(['/api/cache/inspect', '/api/download-live'], async (req, res) => {
 
 // Get current cached items for a user
 app.get('/api/cache/:username', (req, res) => {
-  const clean = req.params.username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(req.params.username);
   const items = cacheManager.getCachedItems(clean);
   res.json({ username: clean, count: items.length, items });
 });
 
 // Download single cached item (preserved on server while user is on site)
 app.get('/api/cache/download/:username/:itemId', (req, res) => {
-  const clean = req.params.username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(req.params.username);
   const itemId = req.params.itemId;
   const items = cacheManager.getCachedItems(clean);
   const target = items.find(i => i.id === itemId);
@@ -478,7 +505,10 @@ app.post('/api/cache/download-selected', (req, res) => {
     return res.status(400).json({ error: 'Username and itemIds array are required' });
   }
 
-  const clean = username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(username);
+  if (!clean) {
+    return res.status(400).json({ error: 'Invalid username format' });
+  }
   const allItems = cacheManager.getCachedItems(clean);
   const selectedItems = allItems.filter(i => itemIds.includes(i.id) && i.filePath && fs.existsSync(i.filePath));
 
@@ -486,7 +516,8 @@ app.post('/api/cache/download-selected', (req, res) => {
     return res.status(404).json({ error: 'No matching files found in cache' });
   }
 
-  const archive = createZipArchive({ zlib: { level: 9 } });
+  // Fast store mode (no re-compression, instant streaming, avoids OOM RAM spikes)
+  const archive = createZipArchive({ store: true });
   const zipFilename = `${clean}_selected_${selectedItems.length}_files_${Date.now()}.zip`;
 
   res.setHeader('Content-Type', 'application/zip');
@@ -526,7 +557,10 @@ app.post('/api/cache/session-cleanup', express.text({ type: '*/*' }), (req, res)
     }
 
     if (username) {
-      const clean = username.trim().toLowerCase().replace(/^@/, '');
+      const clean = cleanHandle(username);
+  if (!clean) {
+    return res.status(400).json({ error: 'Invalid username format' });
+  }
       scheduleUserCacheCleanup(clean, 4000); // Purge within 4 seconds of leaving
     }
   } catch (e) {}
@@ -535,7 +569,8 @@ app.post('/api/cache/session-cleanup', express.text({ type: '*/*' }), (req, res)
 
 // Clear cache for a user
 app.delete('/api/cache/:username', (req, res) => {
-  const clean = req.params.username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(req.params.username);
+  if (!clean) return res.status(400).json({ error: 'Invalid username' });
   cacheManager.clearUserCache(clean);
   broadcast({
     type: 'CACHE_CLEARED',
@@ -561,13 +596,14 @@ app.get('/api/targets/:id/download-zip', (req, res) => {
     return res.status(404).send('Target not found');
   }
 
-  const clean = target.username;
+  const clean = cleanHandle(target.username);
   sendTargetZip(clean, res);
 });
 
 // Download Any Profile Archive as a single ZIP file by username
 app.get('/api/download-zip/:username', (req, res) => {
-  const clean = req.params.username.trim().toLowerCase().replace(/^@/, '');
+  const clean = cleanHandle(req.params.username);
+  if (!clean) return res.status(400).send('Invalid username');
   sendTargetZip(clean, res);
 });
 
@@ -578,9 +614,8 @@ function sendTargetZip(clean, res) {
     return res.status(404).send(`No downloaded media found for @${clean}`);
   }
 
-  const archive = createZipArchive({
-    zlib: { level: 9 } // Maximum compression
-  });
+  // Fast store mode (near 0% CPU, no OOM RAM spikes on already compressed media)
+  const archive = createZipArchive({ store: true });
 
   const zipFilename = `${clean}_instagram_archive_${new Date().toISOString().slice(0, 10)}.zip`;
 
@@ -602,10 +637,18 @@ function sendTargetZip(clean, res) {
 // Settings
 app.get('/api/settings', (req, res) => {
   const settings = db.getSettings();
-  // Mask sensitive token for security
+  const rawCookie = settings.sessionCookie || '';
+  const sessionMatch = rawCookie.match(/sessionid=([^;]+)/);
+  const maskedCookie = sessionMatch
+    ? `sessionid=${sessionMatch[1].slice(0, 8)}...***`
+    : (rawCookie ? `${rawCookie.slice(0, 10)}...***` : '');
+
+  // Mask sensitive token & cookie for security
   const masked = {
     ...settings,
-    telegramTokenMasked: settings.telegramToken ? `${settings.telegramToken.slice(0, 6)}...${settings.telegramToken.slice(-4)}` : ''
+    sessionCookie: maskedCookie,
+    telegramTokenMasked: settings.telegramToken ? `${settings.telegramToken.slice(0, 6)}...${settings.telegramToken.slice(-4)}` : '',
+    hasSessionCookie: Boolean(rawCookie)
   };
   res.json(masked);
 });
@@ -625,6 +668,13 @@ app.put('/api/settings', (req, res) => {
     const updates = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) {
+        // If incoming sessionCookie or telegramToken is the masked placeholder, do not overwrite the real secret
+        if (key === 'sessionCookie' && typeof req.body[key] === 'string' && req.body[key].includes('...***')) {
+          continue;
+        }
+        if (key === 'telegramToken' && typeof req.body[key] === 'string' && req.body[key].includes('...')) {
+          continue;
+        }
         updates[key] = req.body[key];
       }
     }
@@ -700,8 +750,12 @@ server.listen(config.PORT, config.HOST, () => {
 // Graceful shutdown on SIGINT & SIGTERM (Render / Railway / Docker / Kubernetes)
 const handleShutdown = (signal) => {
   console.log(`\n[Server] Received ${signal}. Shutting down gracefully...`);
+  if (typeof wsHeartbeatInterval !== 'undefined') {
+    clearInterval(wsHeartbeatInterval);
+  }
   monitor.stop();
   telegramBot.stop();
+  db.flushSync(); // Ensure all debounced database changes are written to disk
   server.close(() => {
     console.log('[Server] HTTP and WebSocket servers closed. Exiting.');
     process.exit(0);
