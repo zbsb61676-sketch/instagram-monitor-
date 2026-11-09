@@ -14,6 +14,7 @@ const { downloadTargetContent } = require('./downloader');
 const proxyManager = require('./proxyManager');
 const cacheManager = require('./cacheManager');
 const telegramBot = require('./telegramBot');
+const keepAlive = require('./keepAlive');
 
 const app = express();
 const server = http.createServer(app);
@@ -163,13 +164,30 @@ const wsHeartbeatInterval = setInterval(() => {
 
 // --- REST API Endpoints ---
 
-// Health & Ping (Keep-Alive for free cloud servers like Render / Koyeb)
-app.get('/api/ping', (req, res) => {
+// Health & Ping Endpoints (Render.com 24/7 Anti-Sleep Keep-Alive)
+app.get(['/health', '/ping', '/api/ping'], (req, res) => {
+  const keepAliveStatus = keepAlive.getStatus();
   res.json({
     status: 'ok',
+    service: 'instagram-privacy-monitor',
     uptime: process.uptime(),
+    keepAlive: {
+      active: keepAliveStatus.active,
+      pingCount: keepAliveStatus.pingCount,
+      lastPing: keepAliveStatus.lastPingTime,
+      url: keepAliveStatus.configuredUrl
+    },
     timestamp: new Date().toISOString()
   });
+});
+
+app.get('/api/keepalive', (req, res) => {
+  res.json(keepAlive.getStatus());
+});
+
+app.post('/api/keepalive/ping', async (req, res) => {
+  const result = await keepAlive.pingNow();
+  res.json(result);
 });
 
 app.get('/api/status', (req, res) => {
@@ -659,6 +677,7 @@ app.put('/api/settings', (req, res) => {
       'defaultIntervalSec',
       'proxyUrl',
       'sessionCookie',
+      'appUrl',
       'soundAlertEnabled',
       'autoDownloadOnPublic'
     ];
@@ -676,6 +695,9 @@ app.put('/api/settings', (req, res) => {
       }
     }
     const updated = db.updateSettings(updates);
+    if (updates.appUrl !== undefined) {
+      keepAlive.setPublicUrl(updates.appUrl);
+    }
     db.addLog('System settings updated', 'info');
     telegramBot.restart();
     broadcast({ type: 'SETTINGS_UPDATED', data: updated });
@@ -742,6 +764,7 @@ server.listen(config.PORT, config.HOST, () => {
   telegramBot.setBroadcastFunction(broadcast);
   telegramBot.setMonitorService(monitor);
   telegramBot.start();
+  keepAlive.start();
 });
 
 // Graceful shutdown on SIGINT & SIGTERM (Render / Railway / Docker / Kubernetes)
@@ -750,6 +773,7 @@ const handleShutdown = (signal) => {
   if (typeof wsHeartbeatInterval !== 'undefined') {
     clearInterval(wsHeartbeatInterval);
   }
+  keepAlive.stop();
   monitor.stop();
   telegramBot.stop();
   db.flushSync(); // Ensure all debounced database changes are written to disk

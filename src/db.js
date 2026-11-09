@@ -19,6 +19,7 @@ const defaultState = {
     defaultIntervalSec: parseInt(process.env.DEFAULT_INTERVAL_SEC || '3', 10),
     proxyUrl: process.env.PROXY_URL || '',
     sessionCookie: process.env.IG_SESSION_COOKIE || '',
+    appUrl: process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || '',
     soundAlertEnabled: true,
     autoDownloadOnPublic: true
   },

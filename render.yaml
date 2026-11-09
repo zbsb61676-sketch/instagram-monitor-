@@ -5,6 +5,7 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
@@ -19,4 +20,6 @@ services:
       - key: IG_SESSION_COOKIE
         sync: false
       - key: PROXY_URL
+        sync: false
+      - key: APP_URL
         sync: false

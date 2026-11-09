@@ -503,13 +503,43 @@
           </div>
         </div>
 
-        <!-- Keep-Alive Ping URL for Render/Koyeb -->
-        <div class="p-3 rounded-xl bg-gray-800/40 border border-gray-800 flex items-center justify-between text-xs text-gray-400">
-          <div>
-            <span class="font-semibold text-gray-300">Keep-Alive Ping Endpoint:</span>
-            <code class="ml-2 text-pink-400 bg-black/30 px-2 py-0.5 rounded">/api/ping</code>
+        <!-- Render 24/7 Anti-Sleep Keep-Alive Configuration -->
+        <div class="p-4 rounded-xl bg-gray-900 border border-gray-800 space-y-3">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-2">
+              <i class="fa-solid fa-bolt text-amber-400 text-lg"></i>
+              <span class="font-bold text-sm text-white">Render 24/7 Anti-Sleep Keep-Alive</span>
+            </div>
+            <span id="keepAliveBadge" class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-gray-800 text-gray-400 border border-gray-700">
+              Checking...
+            </span>
           </div>
-          <span class="text-[11px] text-gray-500">Ping every 5m with cron-job.org to keep Render alive 24/7</span>
+          <p class="text-xs text-gray-400">
+            Render free-tier instances sleep after 15 minutes of inactivity. Enter your app's public URL below so the server can automatically ping itself every 10 minutes to stay awake 24/7.
+          </p>
+          <div>
+            <label class="block text-xs font-semibold text-gray-300 mb-1">Render Public App URL</label>
+            <div class="flex space-x-2">
+              <input
+                type="text"
+                id="cfgAppUrl"
+                placeholder="https://instagram-privacy-monitor.onrender.com"
+                autocomplete="off"
+                class="flex-1 px-3 py-2 rounded-lg bg-dark-850 border border-gray-700 text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-amber-500 text-xs"
+              />
+              <button
+                type="button"
+                id="testKeepAliveBtn"
+                class="px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-semibold border border-gray-700 transition flex items-center space-x-1.5"
+              >
+                <i class="fa-solid fa-arrows-rotate"></i>
+                <span>Test Ping</span>
+              </button>
+            </div>
+            <span id="keepAliveFeedback" class="text-[11px] text-gray-500 mt-1 block">
+              Auto-detected if RENDER_EXTERNAL_URL is available. Free ping endpoint: <code class="text-pink-400">/health</code>
+            </span>
+          </div>
         </div>
 
         <!-- Modal Actions -->

@@ -119,6 +119,10 @@ const cfgDiscordWebhook = document.getElementById('cfgDiscordWebhook');
 const cfgProxyUrl = document.getElementById('cfgProxyUrl');
 const cfgSessionCookie = document.getElementById('cfgSessionCookie');
 const cfgAutoDownload = document.getElementById('cfgAutoDownload');
+const cfgAppUrl = document.getElementById('cfgAppUrl');
+const testKeepAliveBtn = document.getElementById('testKeepAliveBtn');
+const keepAliveBadge = document.getElementById('keepAliveBadge');
+const keepAliveFeedback = document.getElementById('keepAliveFeedback');
 
 // Gallery Modal Elements
 const mediaGalleryModal = document.getElementById('mediaGalleryModal');
@@ -1197,12 +1201,75 @@ function loadSettingsIntoModal() {
   cfgDiscordWebhook.value = state.settings.discordWebhookUrl || '';
   cfgProxyUrl.value = state.settings.proxyUrl || '';
   cfgSessionCookie.value = state.settings.sessionCookie || '';
+  if (cfgAppUrl) {
+    cfgAppUrl.value = state.settings.appUrl || '';
+  }
   if (cfgAutoDownload) {
     cfgAutoDownload.checked = state.settings.autoDownloadOnPublic !== false;
   }
 
   telegramFeedback.classList.add('hidden');
   discordFeedback.classList.add('hidden');
+
+  // Check Keep-Alive status
+  fetchKeepAliveStatus();
+}
+
+async function fetchKeepAliveStatus() {
+  if (!keepAliveBadge) return;
+  try {
+    const res = await fetch('/api/keepalive');
+    const data = await res.json();
+    if (data.active && data.configuredUrl) {
+      keepAliveBadge.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30';
+      keepAliveBadge.innerHTML = `<i class="fa-solid fa-circle-check mr-1"></i> 24/7 Active (${data.pingCount} pings)`;
+      if (keepAliveFeedback) {
+        keepAliveFeedback.innerHTML = `Active target: <code class="text-emerald-400">${data.configuredUrl}/health</code> • Pinging every 10m`;
+      }
+      if (cfgAppUrl && !cfgAppUrl.value) {
+        cfgAppUrl.value = data.configuredUrl;
+      }
+    } else {
+      keepAliveBadge.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30';
+      keepAliveBadge.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-1"></i> URL Needed`;
+      if (keepAliveFeedback) {
+        keepAliveFeedback.innerHTML = `Enter your Render app URL above so the server auto-pings every 10m to prevent sleeping.`;
+      }
+    }
+  } catch (e) {
+    keepAliveBadge.className = 'px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-gray-800 text-gray-400 border border-gray-700';
+    keepAliveBadge.innerText = 'Offline';
+  }
+}
+
+if (testKeepAliveBtn) {
+  testKeepAliveBtn.addEventListener('click', async () => {
+    testKeepAliveBtn.disabled = true;
+    testKeepAliveBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Pinging...';
+    try {
+      // First save URL if changed
+      if (cfgAppUrl && cfgAppUrl.value.trim()) {
+        await fetch('/api/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ appUrl: cfgAppUrl.value.trim() })
+        });
+      }
+      const res = await fetch('/api/keepalive/ping', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(`Keep-Alive ping succeeded! (${data.latency}ms)`, 'success');
+        fetchKeepAliveStatus();
+      } else {
+        showToast(`Ping failed: ${data.error || 'Check URL'}`, 'error');
+      }
+    } catch (e) {
+      showToast(`Ping error: ${e.message}`, 'error');
+    } finally {
+      testKeepAliveBtn.disabled = false;
+      testKeepAliveBtn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> <span>Test Ping</span>';
+    }
+  });
 }
 
 settingsForm.addEventListener('submit', async (e) => {
@@ -1213,6 +1280,7 @@ settingsForm.addEventListener('submit', async (e) => {
     discordWebhookUrl: cfgDiscordWebhook.value.trim(),
     proxyUrl: cfgProxyUrl.value.trim(),
     sessionCookie: cfgSessionCookie.value.trim(),
+    appUrl: cfgAppUrl ? cfgAppUrl.value.trim() : '',
     autoDownloadOnPublic: cfgAutoDownload ? cfgAutoDownload.checked : true
   };
 

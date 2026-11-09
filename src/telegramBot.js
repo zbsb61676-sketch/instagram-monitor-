@@ -15,6 +15,7 @@ const telegramClient = require('./telegramClient');
 const { checkInstagramProfile } = require('./igChecker');
 const { downloadTargetContent, fetchActiveStories, fetchHighlights } = require('./downloader');
 const { dispatchTransitionAlert } = require('./notifier');
+const keepAlive = require('./keepAlive');
 
 class TelegramBotService {
   constructor() {
@@ -270,6 +271,10 @@ class TelegramBotService {
       return this.sendStatsMessage(token, chatId);
     }
 
+    if (cmd === '/keepalive' || cmd === '/ping' || cmd === '/url') {
+      return this.handleKeepAliveCommand(token, chatId, arg1);
+    }
+
     // Natural text: If user sends an Instagram handle directly (e.g. "@yam.wzzz" or "yam.wzzz")
     const cleanHandle = text.replace(/^@/, '').trim();
     if (/^[a-zA-Z0-9._]{1,30}$/.test(cleanHandle) && !cleanHandle.includes(' ')) {
@@ -360,6 +365,27 @@ class TelegramBotService {
       const username = data.split(':')[1];
       return this.handleFlipCommand(token, chatId, username, settings);
     }
+
+    if (data === 'keepalive:ping') {
+      await telegramClient.answerCallbackQuery(token, cbId, 'Sending Keep-Alive Heartbeat...');
+      const res = await keepAlive.pingNow();
+      if (res.ok) {
+        await this.sendMessage(token, chatId, `✅ <b>Keep-Alive Heartbeat Succeeded!</b>\n• Latency: <b>${res.latency}ms</b>\n• Status: <b>HTTP ${res.status}</b>\n• Render 15m sleep timer reset successfully.`);
+      } else {
+        await this.sendMessage(token, chatId, `⚠️ <b>Keep-Alive Heartbeat Failed:</b> ${res.error || `HTTP ${res.status}`}\nMake sure your Render URL is accessible.`);
+      }
+      return;
+    }
+
+    if (data === 'keepalive:status') {
+      await telegramClient.answerCallbackQuery(token, cbId);
+      return this.handleKeepAliveCommand(token, chatId);
+    }
+
+    if (data === 'server:stats') {
+      await telegramClient.answerCallbackQuery(token, cbId);
+      return this.sendStatsMessage(token, chatId);
+    }
   }
 
   // --- Command Implementations ---
@@ -392,6 +418,7 @@ class TelegramBotService {
       `🧪 <b>Testing Tools:</b>`,
       `• <code>/flip &lt;username&gt;</code> - Test Public ⇄ Private siren alert with media buttons`,
       `• <code>/stats</code> - Server uptime & statistics`,
+      `• <code>/keepalive [url]</code> - Keep Render server awake 24/7 (anti-sleep)`,
       ``,
       `💡 <i>Tip: You can also just type any username (e.g. <code>@yam.wzzz</code>) to inspect it instantly!</i>`
     ].join('\n');
@@ -1307,12 +1334,76 @@ class TelegramBotService {
     );
   }
 
+  async handleKeepAliveCommand(token, chatId, newUrl = null) {
+    if (newUrl) {
+      const cleanUrl = keepAlive.setPublicUrl(newUrl);
+      await this.sendMessage(token, chatId, `⏳ <b>Configuring Render Public URL:</b>\n<code>${cleanUrl}</code>\nSending test heartbeat now...`);
+      const testRes = await keepAlive.pingNow();
+      if (testRes.ok) {
+        return this.sendMessage(token, chatId, 
+          `✅ <b>Keep-Alive Successfully Configured!</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🌐 <b>Target:</b> <code>${cleanUrl}/health</code>\n` +
+          `⚡ <b>Latency:</b> ${testRes.latency}ms (HTTP ${testRes.status})\n` +
+          `🔄 <b>Heartbeat:</b> Auto-pings every 10 minutes\n` +
+          `🛡️ <b>Render Anti-Sleep:</b> <b>ACTIVE 24/7</b>\n\n` +
+          `<i>Your Render server will now stay awake continuously!</i>`
+        );
+      } else {
+        return this.sendMessage(token, chatId, 
+          `⚠️ <b>URL Saved, but test ping returned an error:</b>\n${testRes.error || `HTTP ${testRes.status}`}\n\n` +
+          `Make sure the URL is accessible from the internet (e.g. <code>https://my-app.onrender.com</code>).`
+        );
+      }
+    }
+
+    const ka = keepAlive.getStatus();
+    const isActive = Boolean(ka.configuredUrl && ka.active);
+    const badge = isActive ? '🟢 <b>ACTIVE (24/7 Awake)</b>' : '⚠️ <b>URL NOT CONFIGURED</b>';
+    
+    const lines = [
+      `🛡️ <b>Render 24/7 Anti-Sleep Keep-Alive Engine</b>`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `• Status: ${badge}`,
+      `• Public URL: ${ka.configuredUrl ? `<code>${ka.configuredUrl}</code>` : '<i>Not configured</i>'}`,
+      `• Environment: <b>${ka.isRender ? 'Render.com Cloud' : 'Self-Hosted / Local'}</b>`,
+      `• Heartbeat Interval: <b>Every 10 minutes</b>`,
+      `• Pings Dispatched: <b>${ka.pingCount}</b>`,
+      ka.lastPingTime ? `• Last Heartbeat: <code>${new Date(ka.lastPingTime).toLocaleTimeString()}</code> (${ka.lastPingLatencyMs || 0}ms)` : null,
+      ka.lastError ? `• Last Error: ⚠️ <i>${escapeHtml(ka.lastError)}</i>` : null,
+      ``,
+      `💡 <b>How it works:</b>`,
+      `Render spins down free services after 15 minutes of inactivity. This engine sends a heartbeat every 10 minutes to reset Render's sleep timer, keeping monitoring & Telegram bot online 24/7!`,
+      ``,
+      ka.configuredUrl 
+        ? `<i>To change URL:</i> <code>/keepalive https://your-service.onrender.com</code>`
+        : `👉 <i>To activate, send:</i> <code>/keepalive https://your-service.onrender.com</code>`
+    ].filter(Boolean).join('\n');
+
+    const buttons = [];
+    if (ka.configuredUrl) {
+      buttons.push([
+        { text: '🔄 Ping Now (Reset Timer)', callback_data: 'keepalive:ping' }
+      ]);
+    }
+    buttons.push([
+      { text: '📊 Server Stats', callback_data: 'server:stats' }
+    ]);
+
+    await this.sendMessage(token, chatId, lines, {
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
   async sendStatsMessage(token, chatId) {
     const targets = db.getTargets();
     const settings = db.getSettings();
+    const ka = keepAlive.getStatus();
     const publicCount = targets.filter(t => t.status === 'public').length;
     const privateCount = targets.filter(t => t.status === 'private').length;
     const monitoringCount = targets.filter(t => t.isMonitoring).length;
+
+    const kaStatus = ka.configuredUrl ? `🟢 24/7 Active (${ka.pingCount} pings)` : '⚠️ No URL Set (/keepalive)';
 
     const stats = [
       `📊 <b>Instagram Privacy Monitor Statistics</b>`,
@@ -1322,11 +1413,22 @@ class TelegramBotService {
       `• Public Accounts: 🟢 <b>${publicCount}</b>`,
       `• Private Accounts: 🔒 <b>${privateCount}</b>`,
       `• Session Cookie: <b>${settings.sessionCookie ? '✅ Active' : '❌ Missing'}</b>`,
+      `• Render Keep-Alive: <b>${kaStatus}</b>`,
+      ka.configuredUrl ? `  └ URL: <code>${ka.configuredUrl}</code>` : null,
       `• Auto-Download: <b>${settings.autoDownloadOnPublic !== false ? '✅ Enabled' : '❌ Disabled'}</b>`,
       `• Server Time: <code>${new Date().toUTCString()}</code>`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
-    await this.sendMessage(token, chatId, stats);
+    await this.sendMessage(token, chatId, stats, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🛡️ Keep-Alive Status', callback_data: 'keepalive:status' },
+            { text: '🔄 Heartbeat Ping', callback_data: 'keepalive:ping' }
+          ]
+        ]
+      }
+    });
   }
 
   // --- Telegram API Helpers (Direct IPv4) ---
