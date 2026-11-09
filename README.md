@@ -59,23 +59,62 @@ You can configure these directly inside the **Web Dashboard (Alerts & Config)** 
 
 ---
 
-## ☁️ Deploying on Free Servers (24/7 Online)
+## ☁️ Cloud Deployment & Auto-Redeploy Workflow (24/7 Online)
 
-You can host this 100% free with any of the following platforms:
+Every time you make changes to the code, simply pushing to your GitHub repository will **automatically trigger a rebuild and redeployment** on your cloud platform with zero downtime!
 
-### Option 1: Render.com (Easiest)
-1. Push this project folder to your GitHub account (`git init`, `git add .`, `git commit -m "init"`, `git push`).
-2. Go to [render.com](https://render.com) and click **New Web Service**.
-3. Connect your GitHub repository.
-4. Configure settings:
-   - **Environment:** `Node`
+### Step 1: Create a GitHub Repository & Push
+```bash
+# 1. Create a new repository on GitHub (https://github.com/new)
+# 2. Link your local project to your new GitHub repository:
+git remote add origin https://github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>.git
+git push -u origin main
+```
+
+### Step 2: Connect to Cloud Hosting
+
+#### Option A: Render.com (Recommended Free Tier)
+1. Go to [render.com](https://render.com) and click **New +** ➔ **Web Service**.
+2. Connect your GitHub repository.
+3. Render will automatically detect [`render.yaml`](render.yaml) or use:
+   - **Runtime:** `Node`
    - **Build Command:** `npm install`
    - **Start Command:** `npm start`
-   - **Plan:** Free
-5. Click **Create Web Service**.
+4. In **Environment Variables**, add:
+   - `TELEGRAM_TOKEN`: Your bot token
+   - `TELEGRAM_CHAT_ID`: Your chat ID
+   - `IG_SESSION_COOKIE`: Your Instagram session cookie
+5. Ensure **Auto-Deploy** is set to **Yes** (enabled by default).
+6. Click **Create Web Service**.
 
-> **Keep-Alive Tip (Prevents Sleep):** Render's free tier sleeps after 15 minutes of inactivity. Go to [cron-job.org](https://cron-job.org) or [uptimerobot.com](https://uptimerobot.com) (both 100% free) and add a monitor to ping your Render URL's keep-alive endpoint every 5 minutes:
+> **Keep-Alive Tip (Prevents Sleep):** Render's free tier sleeps after 15 minutes of inactivity. Set up a free monitor on [cron-job.org](https://cron-job.org) or [uptimerobot.com](https://uptimerobot.com) to ping your server every 5–10 minutes:
 > `https://your-app-name.onrender.com/api/ping`
+
+#### Option B: Railway.app (Fastest Deploys)
+1. Go to [railway.app](https://railway.app) and click **New Project** ➔ **Deploy from GitHub repo**.
+2. Select your repository.
+3. Add your environment variables in the **Variables** tab.
+4. Railway will automatically build and deploy using [`railway.json`](railway.json).
+
+---
+
+### 🔄 How to Make Changes and Redeploy Anytime
+
+Whenever you want to modify code, add features, or update settings, you have two super easy options:
+
+#### Option 1: Use the One-Click Script
+```bash
+.\deploy.bat "Added new features"
+```
+This automatically stages changes, commits them with your message, and pushes to GitHub.
+
+#### Option 2: Standard Git Commands
+```bash
+git add .
+git commit -m "Your update message"
+git push
+```
+Render or Railway will immediately detect the push via GitHub Webhooks, build the updated code, and redeploy it live in **under 60 seconds**!
 
 ---
 
