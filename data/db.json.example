@@ -1,0 +1,15 @@
+{
+  "settings": {
+    "telegramToken": "",
+    "telegramChatId": "",
+    "discordWebhookUrl": "",
+    "defaultIntervalSec": 3,
+    "proxyUrl": "",
+    "sessionCookie": "",
+    "soundAlertEnabled": true,
+    "autoDownloadOnPublic": true
+  },
+  "targets": [],
+  "logs": [],
+  "downloadedMedia": {}
+}

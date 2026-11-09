@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: instagram-privacy-monitor
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: IG_SESSION_COOKIE
+        sync: false
+      - key: PROXY_URL
+        sync: false

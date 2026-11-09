@@ -1,0 +1,24 @@
+{
+  "name": "instagram-privacy-monitor",
+  "version": "1.0.0",
+  "description": "Real-time Instagram account privacy status monitor with Telegram and Discord alerts",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --dns-result-order=ipv4first src/server.js",
+    "dev": "node --dns-result-order=ipv4first --watch src/server.js"
+  },
+  "keywords": [
+    "instagram",
+    "monitor",
+    "privacy",
+    "telegram",
+    "discord"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
