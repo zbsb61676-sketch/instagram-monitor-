@@ -10,6 +10,7 @@ if (typeof dns.setDefaultResultOrder === 'function') {
   dns.setDefaultResultOrder('ipv4first');
 }
 
+const db = require('./db');
 const proxyManager = require('./proxyManager');
 
 const USER_AGENTS = [
@@ -93,6 +94,10 @@ async function checkInstagramProfile(username, options = {}) {
     const response = await fetch(url, fetchOptions);
 
     if (response.status === 429) {
+      const mirrorResult = await checkViaMirror(clean);
+      if (mirrorResult) {
+        return mirrorResult;
+      }
       return {
         status: 'rate_limited',
         profileInfo: null,
@@ -137,6 +142,12 @@ async function checkInstagramProfile(username, options = {}) {
         return checkInstagramProfile(username, { ...options, sessionCookie: '' });
       }
 
+      // Anonymous Mirror Fallback (bypasses login checkpoint / IP rate limit)
+      const mirrorResult = await checkViaMirror(clean);
+      if (mirrorResult) {
+        return mirrorResult;
+      }
+
       return {
         status: 'rate_limited',
         profileInfo: null,
@@ -170,11 +181,78 @@ async function checkInstagramProfile(username, options = {}) {
       error: null
     };
   } catch (err) {
+    // Attempt anonymous mirror fallback on network timeout or fetch error
+    const mirrorResult = await checkViaMirror(clean);
+    if (mirrorResult) {
+      return mirrorResult;
+    }
+
     return {
       status: 'error',
       profileInfo: null,
       error: err.message
     };
+  }
+}
+
+/**
+ * Fallback privacy & profile check via anonymous web mirror (Greatfon)
+ * Used when direct Instagram scraping is blocked by datacenter IP rate limits,
+ * login challenges (429/403), or network timeouts.
+ */
+async function checkViaMirror(username) {
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '');
+  if (!clean) return null;
+
+  try {
+    const url = `https://greatfon.com/v/${clean}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': getRandomUserAgent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    if (!html || html.length < 500) return null;
+
+    const isNotFound = /User not found|Page not found|Account not found|404 Not Found/i.test(html);
+    if (isNotFound) {
+      return {
+        status: 'not_found',
+        profileInfo: null,
+        error: 'Account not found (via mirror fallback)'
+      };
+    }
+
+    const isPrivate = /This account is private|Private Account|Follow to see their photos/i.test(html);
+
+    // Extract basic profile metadata from mirror if possible
+    const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+    let fullName = '';
+    if (titleMatch) {
+      const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
+      fullName = parts.replace(new RegExp(`^${clean}\\s*`, 'i'), '').trim();
+    }
+
+    return {
+      status: isPrivate ? 'private' : 'public',
+      profileInfo: {
+        fullName: fullName || clean,
+        isVerified: false,
+        biography: '',
+        profilePicUrl: '',
+        postsCount: 0
+      },
+      fallbackMirror: 'greatfon',
+      error: null
+    };
+  } catch (err) {
+    return null;
   }
 }
 

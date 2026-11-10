@@ -102,10 +102,18 @@ class MonitorService {
         consecutiveErrors = 0;
       }
 
+      // If a single check hits a transient network glitch or rate limit,
+      // DO NOT immediately overwrite the known public/private state!
+      // Only set status to error/rate_limited if errors persist for >= 3 checks in a row.
+      let effectiveStatus = newStatus;
+      if ((newStatus === 'error' || newStatus === 'rate_limited') && consecutiveErrors < 3) {
+        effectiveStatus = target.lastKnownPrivacyState || target.status || 'public';
+      }
+
       const updates = {
         lastCheckedAt: now,
         consecutiveErrors,
-        status: newStatus
+        status: effectiveStatus
       };
 
       if (result.profileInfo) {
@@ -280,6 +288,15 @@ class MonitorService {
   async checkNow(targetId) {
     const target = db.getTarget(targetId);
     if (!target) throw new Error('Target not found');
+
+    // If a background check is currently executing for this target, wait briefly for it
+    if (this.activeLocks.has(targetId)) {
+      for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 200));
+        if (!this.activeLocks.has(targetId)) break;
+      }
+    }
+
     await this.executeCheck(targetId);
     return db.getTarget(targetId);
   }
