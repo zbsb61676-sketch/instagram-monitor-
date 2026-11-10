@@ -701,23 +701,27 @@ class TelegramBotService {
       }
 
       if (validStories.length === 0) {
+        const target = db.getTarget(clean);
+        const hasStoryOnIG = target?.profileInfo?.latestReelMedia;
         const anonyigUrl = anonyigProvider.getAnonyigUrl(clean);
+        const msgHeader = hasStoryOnIG
+          ? `⚠️ <b>Active story detected on Instagram for @${clean}</b>, but direct media access requires an active session cookie or backup viewer.`
+          : `ℹ️ <b>@${clean}</b> currently has no active stories posted in the last 24 hours (stories automatically expire after 24h).`;
         return this.sendMessage(token, chatId, 
-          `ℹ️ <b>@${clean}</b> has no active stories cached or returned via direct API.\n` +
-          `💡 <i>Stories automatically expire after 24 hours.</i>\n\n` +
+          `${msgHeader}\n\n` +
           `🛡️ <b>Anonymous Backup Mirror (AnonyIG):</b>\n` +
-          `You can view active stories anonymously with zero login on AnonyIG:`, {
+          `You can view & play stories anonymously with zero login on AnonyIG:`, {
           reply_markup: {
             inline_keyboard: [
               [
                 { text: '🚀 Open on AnonyIG (Stories)', url: anonyigUrl }
               ],
               [
-                { text: '🎬 View Reels', callback_data: `reels:${clean}` },
-                { text: '📸 View Posts', callback_data: `posts:${clean}` }
+                { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
+                { text: '🎬 View Reels', callback_data: `reels:${clean}` }
               ],
               [
-                { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
+                { text: '📸 View Posts', callback_data: `posts:${clean}` },
                 { text: '📂 Media Menu', callback_data: `media:${clean}` }
               ]
             ]

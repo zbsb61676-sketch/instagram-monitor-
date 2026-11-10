@@ -1105,7 +1105,7 @@ function appendLiveMediaCard(data, prepend = false, addToState = true) {
   card.className = 'media-stream-card relative bg-gray-950 border border-gray-800 rounded-xl overflow-hidden flex flex-col hover:border-amber-400/50 transition transform';
 
   const isVideo = item.type?.includes('video');
-  const isHighlight = item.type === 'highlight';
+  const isHighlight = item.type?.includes('highlight');
   const isStory = item.type?.includes('story');
   const isSlide = item.type?.includes('slide');
   const fileUrl = item.fileUrl;
@@ -1467,7 +1467,7 @@ function filterAndSortGallery() {
   if (activeGalleryFilter === 'slides') {
     list = list.filter(i => i.type?.includes('slide') || i.type === 'photo_post' || i.type === 'video_post');
   } else if (activeGalleryFilter === 'highlights') {
-    list = list.filter(i => i.type === 'highlight');
+    list = list.filter(i => i.type?.includes('highlight'));
   } else if (activeGalleryFilter === 'stories') {
     list = list.filter(i => i.type?.includes('story'));
   }
@@ -1499,7 +1499,7 @@ function renderGalleryItems() {
   // Update badge counts on filter buttons
   const allCount = allGalleryItems.length;
   const slidesCount = allGalleryItems.filter(i => i.type?.includes('slide') || i.type === 'photo_post' || i.type === 'video_post').length;
-  const highlightsCount = allGalleryItems.filter(i => i.type === 'highlight').length;
+  const highlightsCount = allGalleryItems.filter(i => i.type?.includes('highlight')).length;
   const storiesCount = allGalleryItems.filter(i => i.type?.includes('story')).length;
 
   const countAllEl = document.getElementById('filterCountAll');
@@ -1523,6 +1523,18 @@ function renderGalleryItems() {
   if (filtered.length === 0) {
     grid.classList.add('hidden');
     empty.classList.remove('hidden');
+    const emptyTitle = empty.querySelector('p.text-sm');
+    const emptyDesc = empty.querySelector('p.text-xs');
+    if (activeGalleryFilter === 'stories') {
+      if (emptyTitle) emptyTitle.textContent = `No active stories for @${currentGalleryTarget?.username || 'user'}`;
+      if (emptyDesc) emptyDesc.textContent = 'Instagram stories automatically expire after 24 hours. You can view & download stories directly using the In-App Backup Viewer below.';
+    } else if (activeGalleryFilter === 'highlights') {
+      if (emptyTitle) emptyTitle.textContent = `No highlights saved for @${currentGalleryTarget?.username || 'user'}`;
+      if (emptyDesc) emptyDesc.textContent = 'You can browse and download all full highlight reels anonymously using the In-App Backup Viewer below.';
+    } else {
+      if (emptyTitle) emptyTitle.textContent = 'No content downloaded for this account yet';
+      if (emptyDesc) emptyDesc.textContent = 'Click "Download Media" on the target card to fetch available content.';
+    }
     return;
   }
 
@@ -1535,7 +1547,7 @@ function renderGalleryItems() {
     card.className = 'bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex flex-col group hover:border-pink-500/60 transition cursor-pointer transform hover:-translate-y-0.5 duration-200';
 
     const isVideo = item.type?.includes('video') || item.fileUrl?.endsWith('.mp4');
-    const isHighlight = item.type === 'highlight';
+    const isHighlight = item.type?.includes('highlight');
     const isStory = item.type?.includes('story');
     const isSlide = item.type?.includes('slide');
     const fileUrl = item.fileUrl;

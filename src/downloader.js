@@ -235,7 +235,7 @@ function extractHighlightsFromScripts(scripts) {
                   highlights.push({
                     id,
                     title: node.title || 'Highlight',
-                    coverUrl: node.cover_media_cropped_thumbnail_url || node.cover_media?.thumbnail_src || null
+                    coverUrl: node.cover_media_cropped_thumbnail_url || node.cover_media?.thumbnail_src || node.cover_media?.cropped_image_version?.url || node.cover_media?.image_versions2?.candidates?.[0]?.url || null
                   });
                 }
               }
@@ -249,7 +249,7 @@ function extractHighlightsFromScripts(scripts) {
               highlights.push({
                 id,
                 title: obj.title || 'Highlight',
-                coverUrl: obj.cover_media_cropped_thumbnail_url || obj.cover_media?.thumbnail_src || null
+                coverUrl: obj.cover_media_cropped_thumbnail_url || obj.cover_media?.thumbnail_src || obj.cover_media?.cropped_image_version?.url || obj.cover_media?.image_versions2?.candidates?.[0]?.url || null
               });
             }
           }
@@ -818,15 +818,13 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       }
     }
 
-    // 5. Download Active Stories if session cookie is present and authenticated (always downloaded fresh)
-    if (options.sessionCookie && userId) {
-      try {
-        const storiesResult = await downloadActiveStories(clean, userId, storiesDir, options, onProgress);
-        summary.newlyDownloaded += storiesResult.newlyDownloaded;
-        summary.downloadedItems.push(...storiesResult.items);
-      } catch (storyErr) {
-        summary.errors.push(`Story download error: ${storyErr.message}`);
-      }
+    // 5. Download Active Stories (always checked and downloaded fresh)
+    try {
+      const storiesResult = await downloadActiveStories(clean, userId, storiesDir, options, onProgress);
+      summary.newlyDownloaded += storiesResult.newlyDownloaded;
+      summary.downloadedItems.push(...storiesResult.items);
+    } catch (storyErr) {
+      summary.errors.push(`Story download error: ${storyErr.message}`);
     }
 
     db.addLog(
@@ -849,9 +847,10 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 async function downloadActiveStories(username, userId, storiesDir, options = {}, onProgress = null) {
   const result = { newlyDownloaded: 0, skipped: 0, items: [] };
   const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!clean) return result;
+
   const settings = db.getSettings();
   const sessionCookie = options.sessionCookie || settings.sessionCookie;
-  if (!sessionCookie || !clean) return result;
 
   const isCache = options.isCache === true;
   const urlPrefix = isCache ? '/cache' : '/downloads';
@@ -863,16 +862,16 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
     return db.recordDownloadedMedia(username, data);
   };
 
-  const cookieHeader = sessionCookie.includes('=')
-    ? sessionCookie
-    : `sessionid=${sessionCookie}`;
+  const cookieHeader = sessionCookie
+    ? (sessionCookie.includes('=') ? sessionCookie : `sessionid=${sessionCookie}`)
+    : '';
 
   let items = [];
 
   // Method 1: Web Stories Page with Authenticated SSR Parsing (Most reliable for web sessions)
   try {
     const webStoriesUrl = `https://www.instagram.com/stories/${clean}/`;
-    const csrfMatch = cookieHeader.match(/csrftoken=([^;]+)/);
+    const csrfMatch = cookieHeader ? cookieHeader.match(/csrftoken=([^;]+)/) : null;
     const csrf = csrfMatch ? csrfMatch[1] : '';
 
     let webFetchOptions = {
@@ -880,8 +879,8 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
       headers: {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Cookie': cookieHeader,
-        'X-CSRFToken': csrf,
+        ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+        ...(csrf ? { 'X-CSRFToken': csrf } : {}),
         'X-IG-App-ID': '936619743392459',
         'X-ASBD-ID': '359341',
         'Sec-Fetch-Dest': 'document',
@@ -967,7 +966,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
         headers: {
           'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
           'X-IG-App-ID': '936619743392459',
-          'Cookie': cookieHeader,
+          ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
           'Accept': '*/*'
         },
         signal: AbortSignal.timeout(10000)
@@ -1000,7 +999,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
           'User-Agent': getRandomUserAgent(),
           'X-IG-App-ID': '936619743392459',
           'X-Requested-With': 'XMLHttpRequest',
-          'Cookie': cookieHeader,
+          ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
           'Referer': `https://www.instagram.com/stories/${clean}/`,
           'Accept': '*/*'
         },
@@ -1129,31 +1128,29 @@ async function fetchActiveStories(username, options = {}) {
 
   let result = { newlyDownloaded: 0, skipped: 0, items: [] };
 
-  if (sessionCookie) {
-    // Attempt fast story extraction via Method 1 (Web stories page)
-    result = await downloadActiveStories(clean, userId, storiesDir, { ...options, sessionCookie });
+  // Attempt story extraction (via authenticated session if configured, or public mobile/web headers)
+  result = await downloadActiveStories(clean, userId, storiesDir, { ...options, sessionCookie });
 
-    // If no stories found and userId is unknown, attempt to fetch userId and retry mobile/reels endpoints
-    if (result.items.length === 0 && !userId) {
-      try {
-        const profileUrl = `https://www.instagram.com/${clean}/`;
-        const res = await fetch(profileUrl, {
-          headers: getBrowserHeaders(),
-          signal: AbortSignal.timeout(8000)
-        });
-        if (res.ok) {
-          const html = await res.text();
-          const details = extractProfileDetails(html, clean);
-          if (details.userId) {
-            userId = details.userId;
-            const retryResult = await downloadActiveStories(clean, userId, storiesDir, { ...options, sessionCookie });
-            if (retryResult.items.length > 0) {
-              result = retryResult;
-            }
+  // If no stories found and userId is unknown, attempt to fetch userId and retry mobile/reels endpoints
+  if (result.items.length === 0 && !userId) {
+    try {
+      const profileUrl = `https://www.instagram.com/${clean}/`;
+      const res = await fetch(profileUrl, {
+        headers: getBrowserHeaders(),
+        signal: AbortSignal.timeout(8000)
+      });
+      if (res.ok) {
+        const html = await res.text();
+        const details = extractProfileDetails(html, clean);
+        if (details.userId) {
+          userId = details.userId;
+          const retryResult = await downloadActiveStories(clean, userId, storiesDir, { ...options, sessionCookie });
+          if (retryResult.items.length > 0) {
+            result = retryResult;
           }
         }
-      } catch (e) {}
-    }
+      }
+    } catch (e) {}
   }
 
   // Fallback: If no new items downloaded or session cookie not configured,
@@ -1290,7 +1287,7 @@ async function fetchHighlights(username, options = {}) {
 
   let result = { newlyDownloaded: 0, items: [], highlights: discoveredHighlights };
 
-  if (discoveredHighlights.length > 0 && sessionCookie) {
+  if (discoveredHighlights.length > 0) {
     const dlResult = await downloadAllHighlights(clean, discoveredHighlights, highlightsDir, { ...options, sessionCookie });
     result.newlyDownloaded = dlResult.newlyDownloaded;
     result.items = dlResult.items;
