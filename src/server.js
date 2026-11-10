@@ -674,6 +674,16 @@ app.get('/api/backup-viewer/:username', async (req, res) => {
     // Inject <base href="https://anonyig.com/"> so all relative assets, CSS, and JS load properly
     html = html.replace('<head>', '<head><base href="https://anonyig.com/">');
 
+    // Inject fallback banner in case browser blocks cross-origin requests
+    const directUrl = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
+    const topBanner = `
+      <div style="background:#0f172a; border-bottom:1px solid #334155; padding:8px 16px; display:flex; justify-content:space-between; align-items:center; color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; font-size:12px; z-index:999999; position:sticky; top:0;">
+        <span>🛡️ <b>Anonymous Story & Highlight Viewer:</b> If stories or highlights take long to load in this frame:</span>
+        <a href="${directUrl}" target="_blank" rel="noopener noreferrer" style="background:#06b6d4; color:#fff; font-weight:700; padding:5px 14px; border-radius:6px; text-decoration:none; margin-left:12px; white-space:nowrap; display:inline-flex; align-items:center; gap:6px;">Open Direct Tab (Fast Download) &rarr;</a>
+      </div>
+    `;
+    html = html.replace(/<body[^>]*>/i, `$&${topBanner}`);
+
     // Strip frame-ancestors and X-Frame-Options to allow seamless in-app embedding
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');

@@ -1988,9 +1988,11 @@ window.openBackupViewer = (username, targetId) => {
   const iframe = document.getElementById('backupViewerIframe');
   const loader = document.getElementById('backupFrameLoader');
   const externalBtn = document.getElementById('backupModalExternalBtn');
+  const directBtn = document.getElementById('backupModalDirectTabBtn');
 
   if (title) title.textContent = `@${clean} • In-App Backup Viewer`;
   if (externalBtn) externalBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
+  if (directBtn) directBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
 
   if (loader) {
     loader.classList.remove('hidden', 'opacity-0');
