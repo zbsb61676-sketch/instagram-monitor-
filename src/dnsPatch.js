@@ -1,42 +1,31 @@
 /**
- * Universal High-Reliability DNS Resolver
+ * Universal High-Reliability DNS Resolver Configuration
  * 
- * Bypasses restrictive/unreliable ISP & hotspot DNS gateways (NXDOMAIN on CDN CNAMEs)
- * by routing lookups through Google DNS (8.8.8.8) and Cloudflare DNS (1.1.1.1) over IPv4.
+ * Sets Node.js DNS result order to 'ipv4first'.
+ * On local Windows development environments, provides fallback to public DNS.
+ * On cloud container environments (Render, Linux, Docker, Heroku), preserves the container's
+ * internal managed DNS resolver (/etc/resolv.conf) to prevent firewall connection drops.
  */
 
 const dns = require('dns');
 
-try {
-  dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4', '1.0.0.1']);
-} catch (e) {}
-
 if (typeof dns.setDefaultResultOrder === 'function') {
-  dns.setDefaultResultOrder('ipv4first');
+  try {
+    dns.setDefaultResultOrder('ipv4first');
+  } catch (e) {}
 }
 
-const origLookup = dns.lookup;
+const isCloudOrLinux = Boolean(
+  process.env.RENDER ||
+  process.env.NODE_ENV === 'production' ||
+  process.platform === 'linux' ||
+  (process.env.PORT && !process.env.USERPROFILE)
+);
 
-dns.lookup = function (hostname, options, callback) {
-  if (typeof options === 'function') {
-    callback = options;
-    options = {};
-  }
-
-  // Never intercept localhost or IP addresses
-  if (!hostname || hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || /^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
-    return origLookup.call(dns, hostname, options, callback);
-  }
-
-  dns.resolve4(hostname, (err, addresses) => {
-    if (!err && addresses && addresses.length > 0) {
-      if (options && options.all) {
-        return callback(null, addresses.map(a => ({ address: a, family: 4 })));
-      }
-      return callback(null, addresses[0], 4);
-    }
-    origLookup.call(dns, hostname, options, callback);
-  });
-};
+if (!isCloudOrLinux) {
+  try {
+    dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4', '1.0.0.1']);
+  } catch (e) {}
+}
 
 module.exports = { dns };

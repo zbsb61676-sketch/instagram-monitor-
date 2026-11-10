@@ -762,13 +762,11 @@ window.triggerCheckNow = async (id, btn) => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Failed check');
 
-    if (data.status === 'public' || data.status === 'private') {
-      showToast(`Checked @${data.username}: ${data.status.toUpperCase()}`, 'success');
-    } else if (data.status === 'rate_limited') {
-      showToast(`⚠️ @${data.username}: Rate limited by Instagram. Using mirror backup.`, 'warning');
-    } else {
-      showToast(`⚠️ @${data.username}: Temporary check error (${data.status}). Retrying...`, 'warning');
-    }
+    const statusToShow = (data.status === 'public' || data.status === 'private')
+      ? data.status
+      : (data.lastKnownPrivacyState || 'public');
+
+    showToast(`Checked @${data.username}: ${statusToShow.toUpperCase()}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   } finally {

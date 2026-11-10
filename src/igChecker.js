@@ -196,64 +196,72 @@ async function checkInstagramProfile(username, options = {}) {
 }
 
 /**
- * Fallback privacy & profile check via anonymous web mirror (Greatfon)
+ * Fallback privacy & profile check via anonymous web mirrors (Greatfon, Dumpor)
  * Used when direct Instagram scraping is blocked by datacenter IP rate limits,
- * login challenges (429/403), or network timeouts.
+ * login challenges (429/403), or network timeouts on Render.
  */
 async function checkViaMirror(username) {
   const clean = (username || '').trim().toLowerCase().replace(/^@/, '');
   if (!clean) return null;
 
-  try {
-    const url = `https://greatfon.com/v/${clean}`;
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': getRandomUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9'
-      },
-      signal: AbortSignal.timeout(8000)
-    });
+  const mirrorUrls = [
+    `https://greatfon.com/v/${clean}`,
+    `https://dumpor.io/v/${clean}`
+  ];
 
-    if (!res.ok) return null;
+  for (const url of mirrorUrls) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9'
+        },
+        signal: AbortSignal.timeout(6000)
+      });
 
-    const html = await res.text();
-    if (!html || html.length < 500) return null;
+      if (!res.ok) continue;
 
-    const isNotFound = /User not found|Page not found|Account not found|404 Not Found/i.test(html);
-    if (isNotFound) {
+      const html = await res.text();
+      if (!html || html.length < 500) continue;
+
+      const isNotFound = /User not found|Page not found|Account not found|404 Not Found/i.test(html);
+      if (isNotFound) {
+        return {
+          status: 'not_found',
+          profileInfo: null,
+          error: 'Account not found (via mirror fallback)'
+        };
+      }
+
+      const isPrivate = /This account is private|Private Account|Follow to see their photos and videos/i.test(html);
+
+      // Extract basic profile metadata from mirror if possible
+      const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+      let fullName = '';
+      if (titleMatch) {
+        const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
+        fullName = parts.replace(new RegExp(`^${clean}\\s*`, 'i'), '').trim();
+      }
+
       return {
-        status: 'not_found',
-        profileInfo: null,
-        error: 'Account not found (via mirror fallback)'
+        status: isPrivate ? 'private' : 'public',
+        profileInfo: {
+          fullName: fullName || clean,
+          isVerified: false,
+          biography: '',
+          profilePicUrl: '',
+          postsCount: 0
+        },
+        fallbackMirror: url.includes('greatfon') ? 'greatfon' : 'dumpor',
+        error: null
       };
+    } catch (err) {
+      // try next mirror
     }
-
-    const isPrivate = /This account is private|Private Account|Follow to see their photos/i.test(html);
-
-    // Extract basic profile metadata from mirror if possible
-    const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
-    let fullName = '';
-    if (titleMatch) {
-      const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
-      fullName = parts.replace(new RegExp(`^${clean}\\s*`, 'i'), '').trim();
-    }
-
-    return {
-      status: isPrivate ? 'private' : 'public',
-      profileInfo: {
-        fullName: fullName || clean,
-        isVerified: false,
-        biography: '',
-        profilePicUrl: '',
-        postsCount: 0
-      },
-      fallbackMirror: 'greatfon',
-      error: null
-    };
-  } catch (err) {
-    return null;
   }
+
+  return null;
 }
 
 /**
