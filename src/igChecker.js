@@ -110,18 +110,37 @@ async function checkInstagramProfile(username, options = {}) {
 
     const html = await response.text();
 
-    // Check if redirected to login page or challenge
-    if (
+    // Check if redirected to login page, checkpoint challenge, or account suspension
+    const isLoginChallenge = 
       response.url.includes('/accounts/login') ||
       response.url.includes('/challenge/') ||
       html.includes('<title>Login • Instagram</title>') ||
       html.includes('Login • Instagram') ||
-      html.includes('"pageID":"CAAIGLoginHomepage"')
-    ) {
+      html.includes('"pageID":"CAAIGLoginHomepage"') ||
+      html.includes('checkpoint_required') ||
+      html.includes('account_suspended') ||
+      html.includes('suspension_banner') ||
+      response.status === 401 ||
+      response.status === 403;
+
+    if (isLoginChallenge) {
+      // If a session cookie was active and triggered a login/checkpoint challenge,
+      // immediately auto-disable it to protect the account and server IP from further flags!
+      if (options.sessionCookie) {
+        console.warn(`[IGChecker] Session cookie flagged or checkpointed by Instagram. Automatically clearing cookie and falling back to Anonymous Safe Mode.`);
+        db.updateSettings({ sessionCookie: '' });
+        db.addLog(
+          `⚠️ Instagram session cookie flagged or expired. Automatically cleared cookie and switched to Anonymous Safe Mode. Never use a personal account!`,
+          'warning'
+        );
+        // Automatically retry without the compromised session cookie in Anonymous Mode
+        return checkInstagramProfile(username, { ...options, sessionCookie: '' });
+      }
+
       return {
         status: 'rate_limited',
         profileInfo: null,
-        error: 'Instagram redirected to Login challenge'
+        error: 'Instagram redirected to Login challenge (IP rate limited)'
       };
     }
 
