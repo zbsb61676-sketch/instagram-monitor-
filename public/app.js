@@ -764,7 +764,11 @@ window.triggerCheckNow = async (id, btn) => {
       ? data.status
       : (data.lastKnownPrivacyState || 'public');
 
-    showToast(`Checked @${data.username}: ${statusToShow.toUpperCase()}`, 'success');
+    if (data.connectionStatus === 'rate_limited') {
+      showToast(`Checked @${data.username}: ${statusToShow.toUpperCase()} (Mirror fallback active)`, 'info');
+    } else {
+      showToast(`Checked @${data.username}: ${statusToShow.toUpperCase()}`, 'success');
+    }
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -1777,7 +1781,7 @@ function renderLightboxItem() {
 
   const total = displayedGalleryItems.length;
   const isVideo = item.type?.includes('video') || item.fileUrl?.endsWith('.mp4');
-  const isHighlight = item.type === 'highlight';
+  const isHighlight = item.type?.includes('highlight');
   const isStory = item.type?.includes('story');
   const isSlide = item.type?.includes('slide');
 
@@ -1811,7 +1815,7 @@ function renderLightboxItem() {
     badgeText = 'Story (Active)';
     badgeClass = 'bg-purple-600 text-white';
   } else if (isHighlight) {
-    badgeText = item.title ? `Highlight: ${item.title}` : 'Highlight';
+    badgeText = (item.highlightTitle || item.title) ? `Highlight: ${item.highlightTitle || item.title}` : 'Highlight';
     badgeClass = 'bg-amber-500 text-black font-extrabold';
   } else if (isSlide) {
     badgeText = item.slideIndex ? `Slide ${item.slideIndex}/${item.totalSlides || ''}` : 'Carousel Slide';

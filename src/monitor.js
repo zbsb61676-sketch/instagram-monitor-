@@ -70,15 +70,15 @@ class MonitorService {
     this.timers.set(target.id, timer);
   }
 
-  async executeCheck(targetId) {
-    if (!this.isRunning) return;
+  async executeCheck(targetId, options = {}) {
+    if (!this.isRunning && !options.force) return;
 
     // Concurrency lock per target
-    if (this.activeLocks.has(targetId)) return;
+    if (this.activeLocks.has(targetId) && !options.force) return;
     this.activeLocks.add(targetId);
 
     const target = db.getTarget(targetId);
-    if (!target || !target.isMonitoring) {
+    if (!target || (!target.isMonitoring && !options.force)) {
       this.activeLocks.delete(targetId);
       return;
     }
@@ -86,9 +86,10 @@ class MonitorService {
     const settings = db.getSettings();
 
     try {
+      // Routine monitoring checks are ALWAYS 100% anonymous to guarantee
+      // the user's account is NEVER challenged, flagged, or suspended.
       const result = await checkInstagramProfile(target.username, {
-        proxyUrl: settings.proxyUrl,
-        sessionCookie: settings.sessionCookie
+        proxyUrl: settings.proxyUrl
       });
 
       const now = new Date().toISOString();
@@ -102,18 +103,20 @@ class MonitorService {
         consecutiveErrors = 0;
       }
 
-      // If a single check hits a transient network glitch or rate limit,
-      // DO NOT immediately overwrite the known public/private state!
-      // Only set status to error/rate_limited if errors persist for >= 5 checks in a row.
-      let effectiveStatus = newStatus;
-      if ((newStatus === 'error' || newStatus === 'rate_limited') && consecutiveErrors < 5) {
+      // Target privacy status is strictly PUBLIC or PRIVATE.
+      // Transient network glitches or rate limits NEVER corrupt a target's privacy state!
+      let effectiveStatus = target.status;
+      if (newStatus === 'public' || newStatus === 'private') {
+        effectiveStatus = newStatus;
+      } else {
         effectiveStatus = target.lastKnownPrivacyState || (target.status !== 'error' && target.status !== 'rate_limited' ? target.status : null) || 'public';
       }
 
       const updates = {
         lastCheckedAt: now,
         consecutiveErrors,
-        status: effectiveStatus
+        status: effectiveStatus,
+        connectionStatus: (newStatus === 'rate_limited') ? 'rate_limited' : (newStatus === 'error' ? 'error' : 'healthy')
       };
 
       if (result.error) {
@@ -296,7 +299,7 @@ class MonitorService {
 
     // Clear active lock to ensure manual user check runs immediately
     this.activeLocks.delete(targetId);
-    await this.executeCheck(targetId);
+    await this.executeCheck(targetId, { force: true });
     return db.getTarget(targetId);
   }
 

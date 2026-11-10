@@ -455,6 +455,70 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
       result.errors.push(`Highlight ${hl.title} fetch error: ${e.message}`);
     }
 
+    // Method 2: Mobile Reels API Endpoint
+    if (reelItems.length === 0) {
+      try {
+        const mobileHlUrl = `https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=highlight:${hlId}`;
+        let mobFetchOptions = {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Instagram 320.0.0.35.109 Android (33/13; 480dpi; 1080x2400; samsung; SM-G998B; p3s; exynos2100; en_US)',
+            'X-IG-App-ID': '936619743392459',
+            'Accept': '*/*',
+            ...(cookieHeader ? { 'Cookie': cookieHeader } : {})
+          },
+          signal: AbortSignal.timeout(12000)
+        };
+        if (options.proxyUrl) {
+          try {
+            const { ProxyAgent } = require('undici');
+            mobFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
+          } catch (e) {}
+        }
+        const mobRes = await fetch(mobileHlUrl, mobFetchOptions);
+        if (mobRes.ok) {
+          const mobData = await mobRes.json();
+          const reel = mobData?.reels?.[`highlight:${hlId}`] || mobData?.reels?.[hlId];
+          if (Array.isArray(reel?.items) && reel.items.length > 0) {
+            reelItems = reel.items;
+          }
+        }
+      } catch (me) {}
+    }
+
+    // Method 3: Web Reels Media Endpoint
+    if (reelItems.length === 0) {
+      try {
+        const webHlUrl = `https://www.instagram.com/api/v1/feed/reels_media/?reel_ids=highlight:${hlId}`;
+        let webReelsOptions = {
+          method: 'GET',
+          headers: {
+            'User-Agent': getRandomUserAgent(),
+            'X-IG-App-ID': '936619743392459',
+            'X-Requested-With': 'XMLHttpRequest',
+            ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+            'Referer': `https://www.instagram.com/stories/highlights/${hlId}/`,
+            'Accept': '*/*'
+          },
+          signal: AbortSignal.timeout(12000)
+        };
+        if (options.proxyUrl) {
+          try {
+            const { ProxyAgent } = require('undici');
+            webReelsOptions.dispatcher = new ProxyAgent(options.proxyUrl);
+          } catch (e) {}
+        }
+        const webRes = await fetch(webHlUrl, webReelsOptions);
+        if (webRes.ok) {
+          const webData = await webRes.json();
+          const reel = webData?.reels?.[`highlight:${hlId}`] || webData?.reels?.[hlId] || webData?.reels_media?.[0];
+          if (Array.isArray(reel?.items) && reel.items.length > 0) {
+            reelItems = reel.items;
+          }
+        }
+      } catch (we) {}
+    }
+
     // Process all items in this highlight reel
     if (reelItems.length > 0) {
       for (let idx = 0; idx < reelItems.length; idx++) {
@@ -664,7 +728,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     let allMedia = [];
 
     for (const scriptContent of scripts) {
-      if (scriptContent.includes('display_uri') || scriptContent.includes('carousel')) {
+      if (scriptContent.includes('display_uri') || scriptContent.includes('display_url') || scriptContent.includes('video_url') || scriptContent.includes('carousel') || scriptContent.includes('edge_owner_to_timeline_media')) {
         try {
           const parsed = JSON.parse(scriptContent);
           const found = extractMediaObjects(parsed);
@@ -783,34 +847,57 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 
       // Standard single image/video post (always downloaded fresh)
       const mediaId = post.pk || post.code;
-      const imagePath = path.join(postsDir, `${post.code}.jpg`);
+      const isVideoWithSource = post.isVideo && Boolean(post.videoUrl);
+      const ext = isVideoWithSource ? 'mp4' : 'jpg';
+      const mainFileName = `${post.code}.${ext}`;
+      const mainPath = path.join(postsDir, mainFileName);
+      const thumbFileName = `${post.code}_thumb.jpg`;
+      const thumbPath = path.join(postsDir, thumbFileName);
 
       try {
-        if (post.displayUrl) {
-          const imgDownloaded = await downloadFile(post.displayUrl, imagePath, options);
-          if (imgDownloaded) {
-            summary.newlyDownloaded++;
+        let fileReady = false;
+        let downloadedThumb = false;
 
-            if (post.caption) {
-              fs.writeFileSync(path.join(postsDir, `${post.code}_caption.txt`), post.caption, 'utf-8');
-            }
-            fs.writeFileSync(path.join(postsDir, `${post.code}.json`), JSON.stringify(post, null, 2), 'utf-8');
+        if (isVideoWithSource) {
+          // Download MP4 video
+          const vidDl = await downloadFile(post.videoUrl, mainPath, options);
+          if (vidDl || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
+            fileReady = true;
+          }
+          // Download video thumbnail
+          if (post.displayUrl) {
+            await downloadFile(post.displayUrl, thumbPath, options);
+            downloadedThumb = true;
+          }
+        } else if (post.displayUrl) {
+          const imgDownloaded = await downloadFile(post.displayUrl, mainPath, options);
+          if (imgDownloaded || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
+            fileReady = true;
+          }
+        }
 
-            const record = recordMedia({
-              id: mediaId,
-              code: post.code,
-              type: post.isVideo ? 'video_post' : 'photo_post',
-              fileName: `${post.code}.jpg`,
-              filePath: imagePath,
-              fileUrl: `${urlPrefix}/${clean}/posts/${post.code}.jpg`,
-              thumbnailUrl: `${urlPrefix}/${clean}/posts/${post.code}.jpg`,
-              thumbnailPath: imagePath,
-              caption: post.caption
-            });
-            summary.downloadedItems.push(record);
-            if (typeof onProgress === 'function') {
-              onProgress({ type: 'ITEM_DOWNLOADED', item: record, current: summary.newlyDownloaded, total: summary.totalFound });
-            }
+        if (fileReady) {
+          summary.newlyDownloaded++;
+
+          if (post.caption) {
+            fs.writeFileSync(path.join(postsDir, `${post.code}_caption.txt`), post.caption, 'utf-8');
+          }
+          fs.writeFileSync(path.join(postsDir, `${post.code}.json`), JSON.stringify(post, null, 2), 'utf-8');
+
+          const record = recordMedia({
+            id: mediaId,
+            code: post.code,
+            type: post.isVideo ? 'video_post' : 'photo_post',
+            fileName: mainFileName,
+            filePath: mainPath,
+            fileUrl: `${urlPrefix}/${clean}/posts/${mainFileName}`,
+            thumbnailUrl: (isVideoWithSource && downloadedThumb) ? `${urlPrefix}/${clean}/posts/${thumbFileName}` : `${urlPrefix}/${clean}/posts/${mainFileName}`,
+            thumbnailPath: (isVideoWithSource && downloadedThumb) ? thumbPath : mainPath,
+            caption: post.caption
+          });
+          summary.downloadedItems.push(record);
+          if (typeof onProgress === 'function') {
+            onProgress({ type: 'ITEM_DOWNLOADED', item: record, current: summary.newlyDownloaded, total: summary.totalFound });
           }
         }
       } catch (postErr) {

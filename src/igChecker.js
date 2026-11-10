@@ -115,10 +115,13 @@ async function checkInstagramProfile(username, options = {}) {
 
     const html = await response.text();
 
+    const locationHeader = response.headers.get('location') || '';
     // Check if redirected to login page, checkpoint challenge, or account suspension
     const isLoginChallenge = 
       response.url.includes('/accounts/login') ||
       response.url.includes('/challenge/') ||
+      locationHeader.includes('/accounts/login') ||
+      locationHeader.includes('/challenge/') ||
       html.includes('<title>Login • Instagram</title>') ||
       html.includes('Login • Instagram') ||
       html.includes('"pageID":"CAAIGLoginHomepage"') ||
@@ -205,8 +208,8 @@ async function checkViaMirror(username) {
   if (!clean) return null;
 
   const mirrorUrls = [
-    `https://greatfon.com/v/${clean}`,
-    `https://dumpor.io/v/${clean}`
+    `https://dumpor.io/v/${clean}`,
+    `https://greatfon.com/v/${clean}`
   ];
 
   for (const url of mirrorUrls) {
@@ -217,7 +220,7 @@ async function checkViaMirror(username) {
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9'
         },
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(9000)
       });
 
       if (!res.ok) continue;
