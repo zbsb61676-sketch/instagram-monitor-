@@ -578,6 +578,17 @@ function createTargetCard(target) {
           </a>
         ` : ''}
 
+        <a
+          href="https://anonyig.com/en2/?url=${encodeURIComponent(target.username)}"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Open 100% anonymous story & highlight viewer (no Instagram login needed)"
+          class="px-2 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-semibold transition flex items-center space-x-1"
+        >
+          <i class="fa-solid fa-shield-halved"></i>
+          <span>AnonyIG</span>
+        </a>
+
         <button
           onclick="toggleMonitoring('${target.id}')"
           title="${isPaused ? 'Resume monitoring' : 'Pause monitoring'}"
@@ -1625,6 +1636,15 @@ window.openGallery = async (targetId, username) => {
 
   if (galleryZipBtn) {
     galleryZipBtn.href = `/api/download-zip/${username}`;
+  }
+
+  const galleryAnonyigBtn = document.getElementById('galleryAnonyigBtn');
+  if (galleryAnonyigBtn) {
+    galleryAnonyigBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(username)}`;
+  }
+  const galleryEmptyAnonyigBtn = document.getElementById('galleryEmptyAnonyigBtn');
+  if (galleryEmptyAnonyigBtn) {
+    galleryEmptyAnonyigBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(username)}`;
   }
 
   title.textContent = `@${username} • Media Gallery`;

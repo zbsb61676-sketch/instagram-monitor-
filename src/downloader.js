@@ -1188,6 +1188,7 @@ async function fetchActiveStories(username, options = {}) {
     }
   }
 
+  result.anonyigUrl = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
   return result;
 }
 
@@ -1333,6 +1334,7 @@ async function fetchHighlights(username, options = {}) {
     }
   }
 
+  result.anonyigUrl = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
   return result;
 }
 

@@ -62,6 +62,9 @@ async function sendTelegramAlert({ username, previousStatus, currentStatus, prof
         [
           { text: '📸 Download Posts', callback_data: `dl:${username}` },
           { text: '📦 Full ZIP Archive', callback_data: `zip:${username}` }
+        ],
+        [
+          { text: '🌐 View on AnonyIG (Backup)', url: `https://anonyig.com/en2/?url=${encodeURIComponent(username)}` }
         ]
       ];
 

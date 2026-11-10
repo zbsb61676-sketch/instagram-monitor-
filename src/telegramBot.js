@@ -16,6 +16,7 @@ const { checkInstagramProfile } = require('./igChecker');
 const { downloadTargetContent, fetchActiveStories, fetchHighlights } = require('./downloader');
 const { dispatchTransitionAlert } = require('./notifier');
 const keepAlive = require('./keepAlive');
+const anonyigProvider = require('./anonyigProvider');
 
 class TelegramBotService {
   constructor() {
@@ -275,6 +276,13 @@ class TelegramBotService {
       return this.handleKeepAliveCommand(token, chatId, arg1);
     }
 
+    if (cmd === '/anonyig' || cmd === '/backup' || cmd === '/anon' || cmd === '/mirror') {
+      if (!arg1) {
+        return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/anonyig yam.wzzz</code>');
+      }
+      return this.handleAnonyigCommand(token, chatId, arg1, settings);
+    }
+
     // Natural text: If user sends an Instagram handle directly (e.g. "@yam.wzzz" or "yam.wzzz")
     const cleanHandle = text.replace(/^@/, '').trim();
     if (/^[a-zA-Z0-9._]{1,30}$/.test(cleanHandle) && !cleanHandle.includes(' ')) {
@@ -366,6 +374,11 @@ class TelegramBotService {
       return this.handleFlipCommand(token, chatId, username, settings);
     }
 
+    if (data.startsWith('anonyig:') || data.startsWith('backup:') || data.startsWith('anon:')) {
+      const username = data.split(':')[1];
+      return this.handleAnonyigCommand(token, chatId, username, settings);
+    }
+
     if (data === 'keepalive:ping') {
       await telegramClient.answerCallbackQuery(token, cbId, 'Sending Keep-Alive Heartbeat...');
       const res = await keepAlive.pingNow();
@@ -404,6 +417,7 @@ class TelegramBotService {
       `• <code>/posts &lt;username&gt;</code> - Download posts, carousels & photo albums`,
       `• <code>/zip &lt;username&gt;</code> - Download full media archive as a ZIP file`,
       `• <code>/avatar &lt;username&gt;</code> - Get HD profile picture`,
+      `• <code>/anonyig &lt;username&gt;</code> - 🛡️ Anonymous backup mirror (Stories, Reels & Highlights - No Login)`,
       ``,
       `🔍 <b>Instant Inspection:</b>`,
       `• <code>/check &lt;username&gt;</code> - Check Public ⇄ Private status & statistics`,
@@ -507,9 +521,10 @@ class TelegramBotService {
         ],
         [
           { text: '📸 Posts', callback_data: `posts:${clean}` },
-          { text: '📦 Full ZIP', callback_data: `zip:${clean}` }
+          { text: '🛡️ AnonyIG Backup', url: anonyigProvider.getAnonyigUrl(clean) }
         ],
         [
+          { text: '📦 Full ZIP', callback_data: `zip:${clean}` },
           { text: '➕ Add Monitor', callback_data: `add:${clean}` }
         ]
       ];
@@ -686,9 +701,17 @@ class TelegramBotService {
       }
 
       if (validStories.length === 0) {
-        return this.sendMessage(token, chatId, `ℹ️ <b>@${clean}</b> has no active stories currently posted.\n💡 <i>Stories automatically expire after 24 hours. When @${clean} posts a new story, you can access it here immediately!</i>`, {
+        const anonyigUrl = anonyigProvider.getAnonyigUrl(clean);
+        return this.sendMessage(token, chatId, 
+          `ℹ️ <b>@${clean}</b> has no active stories cached or returned via direct API.\n` +
+          `💡 <i>Stories automatically expire after 24 hours.</i>\n\n` +
+          `🛡️ <b>Anonymous Backup Mirror (AnonyIG):</b>\n` +
+          `You can view active stories anonymously with zero login on AnonyIG:`, {
           reply_markup: {
             inline_keyboard: [
+              [
+                { text: '🚀 Open on AnonyIG (Stories)', url: anonyigUrl }
+              ],
               [
                 { text: '🎬 View Reels', callback_data: `reels:${clean}` },
                 { text: '📸 View Posts', callback_data: `posts:${clean}` }
@@ -730,7 +753,8 @@ class TelegramBotService {
 
       const bottomButtons = [
         [
-          { text: `📦 Download All (${totalStories}) as ZIP`, callback_data: `zip:${clean}` }
+          { text: `📦 Download All (${totalStories}) as ZIP`, callback_data: `zip:${clean}` },
+          { text: '🌐 AnonyIG Backup', url: anonyigProvider.getAnonyigUrl(clean) }
         ],
         [
           { text: '✨ View Highlights', callback_data: `highlights:${clean}` },
@@ -767,9 +791,16 @@ class TelegramBotService {
 
       const items = result.items || [];
       if (items.length === 0) {
-        return this.sendMessage(token, chatId, `ℹ️ No story highlights found for <b>@${clean}</b>.`, {
+        const anonyigUrl = anonyigProvider.getAnonyigUrl(clean);
+        return this.sendMessage(token, chatId, 
+          `ℹ️ No story highlights returned for <b>@${clean}</b> via direct API.\n\n` +
+          `🛡️ <b>Anonymous Backup Mirror (AnonyIG):</b>\n` +
+          `You can browse and download all highlight reels anonymously without login risk:`, {
           reply_markup: {
             inline_keyboard: [
+              [
+                { text: '✨ View Highlights on AnonyIG', url: anonyigUrl }
+              ],
               [
                 { text: '📱 Check Stories', callback_data: `stories:${clean}` },
                 { text: '🎬 Check Reels', callback_data: `reels:${clean}` }
@@ -815,6 +846,9 @@ class TelegramBotService {
 
         reelRows.push([
           { text: `📦 Download All as ZIP`, callback_data: `zip:${clean}` },
+          { text: `🌐 AnonyIG Mirror`, url: anonyigProvider.getAnonyigUrl(clean) }
+        ]);
+        reelRows.push([
           { text: `📂 Media Menu`, callback_data: `media:${clean}` }
         ]);
 
@@ -893,7 +927,8 @@ class TelegramBotService {
 
       const buttons = [
         [
-          { text: `📦 Download All (${totalMediaInSelection}) as ZIP`, callback_data: `zip:${clean}` }
+          { text: `📦 Download All (${totalMediaInSelection}) as ZIP`, callback_data: `zip:${clean}` },
+          { text: '🌐 AnonyIG Mirror', url: anonyigProvider.getAnonyigUrl(clean) }
         ],
         [
           { text: '📱 Active Stories', callback_data: `stories:${clean}` },
@@ -963,9 +998,16 @@ class TelegramBotService {
       }
 
       if (validReels.length === 0) {
-        return this.sendMessage(token, chatId, `ℹ️ No playable video reels found for <b>@${clean}</b> (account may only have photo posts or be private).`, {
+        const anonyigUrl = anonyigProvider.getAnonyigUrl(clean);
+        return this.sendMessage(token, chatId, 
+          `ℹ️ No playable video reels found for <b>@${clean}</b> via direct API.\n\n` +
+          `🛡️ <b>Anonymous Backup Viewer (AnonyIG & FastDL):</b>\n` +
+          `You can view reels anonymously without login risk:`, {
           reply_markup: {
             inline_keyboard: [
+              [
+                { text: '⚡ View on AnonyIG & FastDL', url: anonyigUrl }
+              ],
               [
                 { text: '📸 View Photos', callback_data: `posts:${clean}` },
                 { text: '📱 View Stories', callback_data: `stories:${clean}` }
@@ -1199,11 +1241,14 @@ class TelegramBotService {
         { text: `🌟 Stream ALL Media (${totalItems} Files)`, callback_data: `all:${clean}` }
       ],
       [
-        { text: `📦 Download All as ZIP (${sizeStr})`, callback_data: `zip:${clean}` },
-        { text: `🖼️ HD Avatar`, callback_data: `avatar:${clean}` }
+        { text: `🛡️ Anonymous AnonyIG Backup`, callback_data: `anonyig:${clean}` },
+        { text: `📦 Download All as ZIP (${sizeStr})`, callback_data: `zip:${clean}` }
       ],
       [
-        { text: `🔍 Check Live Status`, callback_data: `check:${clean}` },
+        { text: `🖼️ HD Avatar`, callback_data: `avatar:${clean}` },
+        { text: `🔍 Check Live Status`, callback_data: `check:${clean}` }
+      ],
+      [
         { text: `⚡ Test Siren Alert`, callback_data: `flip:${clean}` }
       ]
     ];
@@ -1233,6 +1278,54 @@ class TelegramBotService {
     } catch (err) {
       await this.sendMessage(token, chatId, `❌ Avatar lookup failed: ${err.message}`);
     }
+  }
+
+  async handleAnonyigCommand(token, chatId, username, settings) {
+    const clean = username.trim().toLowerCase().replace(/^@/, '');
+    await this.sendChatAction(token, chatId, 'typing');
+
+    const mirrors = anonyigProvider.getMirrorUrls(clean);
+
+    const message = [
+      `🛡️ <b>100% Anonymous Media Backup & Mirror Center</b>`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      `Target Account: <b>@${clean}</b>`,
+      ``,
+      `✨ <b>Zero Instagram Account Risk:</b>`,
+      `These external mirrors fetch stories, highlights, and reels on their own high-speed servers with zero login required. Your Instagram account is 100% safe from suspensions or rate limits!`,
+      ``,
+      `🌐 <b>Recommended Mirror Services:</b>`,
+      `• <b>AnonyIG</b>: Live story, highlight & reel viewer (No login)`,
+      `• <b>FastDL</b>: Direct HD reels & video downloader`,
+      `• <b>Greatfon</b>: Web story & photo archive mirror`,
+      `• <b>SnapInsta</b>: High-speed full resolution downloader`,
+      ``,
+      `<i>Tap any 1-click button below to open in your browser:</i>`
+    ].join('\n');
+
+    const buttons = [
+      [
+        { text: '🚀 Open AnonyIG (Stories & Highlights)', url: mirrors.anonyig }
+      ],
+      [
+        { text: '⚡ FastDL Downloader', url: mirrors.fastdl },
+        { text: '🌐 Greatfon Mirror', url: mirrors.greatfon }
+      ],
+      [
+        { text: '📸 SnapInsta Downloader', url: mirrors.snapinsta }
+      ],
+      [
+        { text: '📱 Check Stories in Bot', callback_data: `stories:${clean}` },
+        { text: '✨ Check Highlights', callback_data: `highlights:${clean}` }
+      ],
+      [
+        { text: '📂 Media Menu', callback_data: `media:${clean}` }
+      ]
+    ];
+
+    await this.sendMessage(token, chatId, message, {
+      reply_markup: { inline_keyboard: buttons }
+    });
   }
 
   async handleAddCommand(token, chatId, username, intervalSec) {
