@@ -666,6 +666,72 @@
     </div>
   </div>
 
+  <!-- In-App Anonymous Backup Viewer Modal (Runs AnonyIG directly inside our dashboard) -->
+  <div id="backupViewerModal" class="hidden fixed inset-0 z-50 overflow-hidden bg-black/85 backdrop-blur-md flex items-center justify-center p-2 sm:p-4">
+    <div class="bg-dark-850 border border-cyan-500/30 rounded-2xl w-full max-w-5xl h-[92vh] flex flex-col shadow-2xl overflow-hidden relative animate-fade-in">
+      
+      <!-- Top Header -->
+      <div class="px-5 py-3.5 bg-gray-900 border-b border-gray-800 flex items-center justify-between">
+        <div class="flex items-center space-x-3">
+          <div class="w-9 h-9 rounded-xl bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+            <i class="fa-solid fa-shield-halved text-base"></i>
+          </div>
+          <div>
+            <div class="flex items-center space-x-2">
+              <h3 id="backupModalTitle" class="text-base font-bold text-white tracking-tight">@username • In-App Backup Viewer</h3>
+              <span class="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                100% ANONYMOUS
+              </span>
+            </div>
+            <p class="text-xs text-gray-400">Stream & download active stories, highlights, and reels directly inside our dashboard</p>
+          </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="flex items-center space-x-2">
+          <button id="backupModalReloadBtn" title="Reload Viewer" class="p-2 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white transition text-xs">
+            <i class="fa-solid fa-rotate-right"></i>
+          </button>
+          <a id="backupModalExternalBtn" href="#" target="_blank" rel="noopener noreferrer" title="Open in External Tab" class="p-2 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white transition text-xs">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i>
+          </a>
+          <button id="closeBackupModalBtn" class="p-2 rounded-xl bg-gray-800 hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition text-sm">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Live Embedded Viewer Body -->
+      <div class="flex-1 bg-gray-950 relative flex flex-col overflow-hidden">
+        <div id="backupFrameLoader" class="absolute inset-0 bg-gray-950/90 flex flex-col items-center justify-center space-y-3 z-10 transition-opacity">
+          <i class="fa-solid fa-circle-notch fa-spin text-3xl text-cyan-400"></i>
+          <p class="text-xs text-cyan-200/80 font-medium tracking-wide">Loading anonymous backup viewer inside dashboard...</p>
+        </div>
+        <iframe
+          id="backupViewerIframe"
+          src="about:blank"
+          class="w-full h-full border-0 flex-1 bg-gray-950"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
+          loading="lazy"
+        ></iframe>
+      </div>
+
+      <!-- Bottom Quick Actions Footer -->
+      <div class="px-5 py-2.5 bg-gray-900 border-t border-gray-800 flex items-center justify-between text-xs text-gray-400">
+        <div class="flex items-center space-x-2">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span>Zero account risk: Stories & highlights fetched anonymously with zero login required</span>
+        </div>
+        <div class="flex items-center space-x-2">
+          <button id="closeBackupModalBottomBtn" class="px-4 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-white font-semibold transition">
+            Close
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
   <!-- Lightbox Modal (Full-Screen HD Story/Post Video Player & Slide Navigator) -->
   <div id="lightboxModal" class="hidden fixed inset-0 z-[60] bg-black/95 backdrop-blur-xl flex flex-col justify-between transition-opacity duration-200 select-none">
     

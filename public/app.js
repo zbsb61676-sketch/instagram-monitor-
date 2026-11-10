@@ -578,16 +578,14 @@ function createTargetCard(target) {
           </a>
         ` : ''}
 
-        <a
-          href="https://anonyig.com/en2/?url=${encodeURIComponent(target.username)}"
-          target="_blank"
-          rel="noopener noreferrer"
-          title="Open 100% anonymous story & highlight viewer (no Instagram login needed)"
+        <button
+          onclick="openBackupViewer('${escapeHtml(target.username)}', '${target.id}')"
+          title="Open in-app anonymous story & highlight viewer (Zero login required)"
           class="px-2 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/20 text-xs font-semibold transition flex items-center space-x-1"
         >
           <i class="fa-solid fa-shield-halved"></i>
-          <span>AnonyIG</span>
-        </a>
+          <span>Backup Viewer</span>
+        </button>
 
         <button
           onclick="toggleMonitoring('${target.id}')"
@@ -1644,11 +1642,17 @@ window.openGallery = async (targetId, username) => {
 
   const galleryAnonyigBtn = document.getElementById('galleryAnonyigBtn');
   if (galleryAnonyigBtn) {
-    galleryAnonyigBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(username)}`;
+    galleryAnonyigBtn.onclick = (e) => {
+      e.preventDefault();
+      openBackupViewer(username, targetId);
+    };
   }
   const galleryEmptyAnonyigBtn = document.getElementById('galleryEmptyAnonyigBtn');
   if (galleryEmptyAnonyigBtn) {
-    galleryEmptyAnonyigBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(username)}`;
+    galleryEmptyAnonyigBtn.onclick = (e) => {
+      e.preventDefault();
+      openBackupViewer(username, targetId);
+    };
   }
 
   title.textContent = `@${username} • Media Gallery`;
@@ -1958,4 +1962,52 @@ window.addEventListener('pagehide', () => {
 window.addEventListener('DOMContentLoaded', () => {
   connectWebSocket();
   updateSessionHealthBadge();
+});
+
+// --- In-App Anonymous Backup Viewer Modal ---
+let currentBackupTarget = null;
+
+window.openBackupViewer = (username, targetId) => {
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '');
+  currentBackupTarget = { username: clean, targetId };
+
+  const modal = document.getElementById('backupViewerModal');
+  const title = document.getElementById('backupModalTitle');
+  const iframe = document.getElementById('backupViewerIframe');
+  const loader = document.getElementById('backupFrameLoader');
+  const externalBtn = document.getElementById('backupModalExternalBtn');
+
+  if (title) title.textContent = `@${clean} • In-App Backup Viewer`;
+  if (externalBtn) externalBtn.href = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
+
+  if (loader) {
+    loader.classList.remove('hidden', 'opacity-0');
+  }
+  if (modal) modal.classList.remove('hidden');
+
+  if (iframe) {
+    iframe.onload = () => {
+      if (loader) {
+        loader.classList.add('opacity-0');
+        setTimeout(() => loader.classList.add('hidden'), 350);
+      }
+    };
+    iframe.src = `/api/backup-viewer/${encodeURIComponent(clean)}`;
+  }
+};
+
+window.closeBackupViewer = () => {
+  const modal = document.getElementById('backupViewerModal');
+  const iframe = document.getElementById('backupViewerIframe');
+  if (modal) modal.classList.add('hidden');
+  if (iframe) iframe.src = 'about:blank';
+};
+
+document.getElementById('closeBackupModalBtn')?.addEventListener('click', window.closeBackupViewer);
+document.getElementById('closeBackupModalBottomBtn')?.addEventListener('click', window.closeBackupViewer);
+
+document.getElementById('backupModalReloadBtn')?.addEventListener('click', () => {
+  if (currentBackupTarget?.username) {
+    window.openBackupViewer(currentBackupTarget.username, currentBackupTarget.targetId);
+  }
 });

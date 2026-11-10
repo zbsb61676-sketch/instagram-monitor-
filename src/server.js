@@ -649,6 +649,43 @@ function sendTargetZip(clean, res) {
   archive.finalize();
 }
 
+// In-App Anonymous Backup Viewer Proxy (Allows AnonyIG to run directly inside our dashboard)
+app.get('/api/backup-viewer/:username', async (req, res) => {
+  const clean = cleanHandle(req.params.username);
+  if (!clean) return res.status(400).send('Invalid username');
+
+  try {
+    const upstreamUrl = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
+    const upstreamRes = await fetch(upstreamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: AbortSignal.timeout(12000)
+    });
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).send(`Backup provider returned HTTP ${upstreamRes.status}`);
+    }
+
+    let html = await upstreamRes.text();
+
+    // Inject <base href="https://anonyig.com/"> so all relative assets, CSS, and JS load properly
+    html = html.replace('<head>', '<head><base href="https://anonyig.com/">');
+
+    // Strip frame-ancestors and X-Frame-Options to allow seamless in-app embedding
+    res.removeHeader('X-Frame-Options');
+    res.removeHeader('Content-Security-Policy');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('X-Frame-Options', 'ALLOWALL');
+
+    res.send(html);
+  } catch (err) {
+    res.status(502).send(`Failed to load in-app backup viewer: ${err.message}`);
+  }
+});
+
 // Settings
 app.get('/api/settings', (req, res) => {
   const settings = db.getSettings();
