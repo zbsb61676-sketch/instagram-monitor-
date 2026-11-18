@@ -10,8 +10,16 @@ const { WebSocketServer } = require('ws');
 const config = require('./config');
 const db = require('./db');
 const monitor = require('./monitor');
+const { Readable } = require('stream');
 const { testTelegram, testDiscord, dispatchTransitionAlert } = require('./notifier');
-const { downloadTargetContent } = require('./downloader');
+const {
+  downloadTargetContent,
+  inspectProfileMedia,
+  inspectHighlightReel,
+  downloadItemsToTempDir,
+  downloadFile
+} = require('./downloader');
+const { httpFetch, isAllowedMediaProxyUrl } = require('./httpClient');
 const proxyManager = require('./proxyManager');
 const cacheManager = require('./cacheManager');
 const storageManager = require('./storageManager');
@@ -1059,6 +1067,244 @@ app.post('/api/settings/test-discord', heavyEndpointLimiter, async (req, res) =>
   } else {
     db.addLog(`Failed to send Discord test notification: ${result.error}`, 'error');
     return res.status(400).json(result);
+  }
+});
+
+// --- 2-Phase Instant Preview & On-Demand Temporary Download Endpoints ---
+
+// SSRF-safe media preview proxy (lets browser render Instagram CDN thumbnails without storing on disk)
+app.get('/api/media-proxy', async (req, res) => {
+  const targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  if (!isAllowedMediaProxyUrl(targetUrl)) {
+    return res.status(400).send('Disallowed media URL');
+  }
+
+  try {
+    const settings = db.getSettings();
+    const { response: upstream } = await httpFetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Referer': 'https://www.instagram.com/',
+        'Accept': 'image/*,video/*,*/*;q=0.8'
+      },
+      signal: AbortSignal.timeout(15000)
+    }, { proxyUrl: settings.proxyUrl, useKeepAlive: true });
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).send(`Upstream HTTP ${upstream.status}`);
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    if (contentType.toLowerCase().startsWith('text/html')) {
+      return res.status(502).send('Upstream returned HTML instead of media');
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    if (upstream.body) {
+      const nodeStream = Readable.fromWeb(upstream.body);
+      nodeStream.on('error', () => {
+        if (!res.headersSent) res.status(502).end();
+        else res.end();
+      });
+      nodeStream.pipe(res);
+    } else {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      res.send(buf);
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(502).send(`Media proxy error: ${err.message}`);
+    }
+  }
+});
+
+// Phase 1: Instant zero-disk profile inspect (~1-2s)
+app.post('/api/temp/inspect', heavyEndpointLimiter, async (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'Username is required' });
+  const clean = cleanHandle(username);
+  if (!clean) return res.status(400).json({ error: 'Invalid username format' });
+
+  const settings = db.getSettings();
+  try {
+    const manifest = await inspectProfileMedia(clean, {
+      proxyUrl: settings.proxyUrl,
+      sessionCookie: settings.sessionCookie
+    });
+    res.json({ success: true, manifest });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Phase 1b: Inspect a single highlight reel on demand (zero disk writes)
+app.post('/api/temp/highlight', heavyEndpointLimiter, async (req, res) => {
+  const { username, highlightId, highlightTitle } = req.body;
+  const clean = cleanHandle(username);
+  if (!clean || !highlightId) {
+    return res.status(400).json({ error: 'username and highlightId are required' });
+  }
+  const settings = db.getSettings();
+  try {
+    const items = await inspectHighlightReel(clean, highlightId, highlightTitle || 'Highlight', {
+      proxyUrl: settings.proxyUrl,
+      sessionCookie: settings.sessionCookie
+    });
+    res.json({ success: true, username: clean, highlightId, items });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Phase 2a: On-demand single-file temporary download (auto-deleted immediately after transfer)
+app.get('/api/temp/download/:username/:itemId', async (req, res) => {
+  const clean = cleanHandle(req.params.username);
+  const itemId = req.params.itemId;
+  const manifest = cacheManager.getInspectManifest(clean);
+  const item = manifest?.items?.find(i => i.id === itemId);
+
+  if (!item || !item.mediaUrl) {
+    return res.status(404).send('Media item expired or not found. Please re-inspect the profile.');
+  }
+
+  const jobDir = path.join(config.CACHE_DIR, '.tmp_dl', `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+  const safeName = (item.fileName || `${itemId}.${item.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const destPath = path.join(jobDir, safeName);
+  const cleanup = () => {
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch (e) {}
+  };
+
+  try {
+    const settings = db.getSettings();
+    await downloadFile(item.mediaUrl, destPath, {
+      proxyUrl: settings.proxyUrl,
+      force: true
+    });
+
+    res.on('close', cleanup);
+    res.download(destPath, safeName, () => {
+      cleanup();
+    });
+  } catch (err) {
+    cleanup();
+    if (!res.headersSent) {
+      res.status(502).send(`Temporary download failed: ${err.message}`);
+    }
+  }
+});
+
+// Phase 2b: On-demand multi-item or full ZIP temporary download (auto-deleted immediately after transfer)
+app.post('/api/temp/download-zip', heavyEndpointLimiter, async (req, res) => {
+  const { username, itemIds, all = false } = req.body;
+  const clean = cleanHandle(username);
+  if (!clean) return res.status(400).json({ error: 'Invalid username format' });
+
+  const manifest = cacheManager.getInspectManifest(clean);
+  if (!manifest || !Array.isArray(manifest.items) || manifest.items.length === 0) {
+    return res.status(404).json({ error: 'Inspect session expired or no media found. Please inspect again.' });
+  }
+
+  const requestedItems = all
+    ? manifest.items
+    : manifest.items.filter(i => Array.isArray(itemIds) && itemIds.includes(i.id));
+
+  if (requestedItems.length === 0) {
+    return res.status(400).json({ error: 'No matching items selected for ZIP download' });
+  }
+
+  const jobDir = path.join(config.CACHE_DIR, '.tmp_dl', `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+  const cleanup = () => {
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch (e) {}
+  };
+
+  try {
+    const settings = db.getSettings();
+    const downloaded = await downloadItemsToTempDir(requestedItems, jobDir, {
+      proxyUrl: settings.proxyUrl
+    });
+
+    if (downloaded.length === 0) {
+      cleanup();
+      return res.status(502).json({ error: 'Failed to fetch selected media files from CDN' });
+    }
+
+    const archive = createZipArchive({ store: true });
+    const zipFilename = `${clean}_temp_${downloaded.length}_files_${Date.now()}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+
+    res.on('finish', cleanup);
+    res.on('close', cleanup);
+
+    archive.on('error', (err) => {
+      console.error(`[TempZIP] Archive error for @${clean}:`, err.message);
+      cleanup();
+      if (!res.headersSent) res.status(500).send('Error creating temporary ZIP');
+    });
+
+    archive.pipe(res);
+
+    const seenNames = new Set();
+    for (const f of downloaded) {
+      let entryName = f.entryName || path.basename(f.filePath);
+      if (seenNames.has(entryName)) {
+        entryName = `${f.id}_${entryName}`;
+      }
+      seenNames.add(entryName);
+      archive.file(f.filePath, { name: entryName });
+    }
+
+    archive.finalize();
+  } catch (err) {
+    cleanup();
+    if (!res.headersSent) {
+      res.status(500).json({ error: `Temporary ZIP failed: ${err.message}` });
+    }
+  }
+});
+
+// --- Database Backup Export & Restore (Survives Cloud Redeploys / Ephemeral Disks) ---
+app.get('/api/backup/export', (req, res) => {
+  const includeSecrets = req.query.includeSecrets === 'true' || req.query.includeSecrets === '1';
+  const snapshot = db.exportSnapshot({ includeSecrets });
+  const filename = `ig-radar-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(JSON.stringify(snapshot, null, 2));
+});
+
+app.post('/api/backup/import', (req, res) => {
+  try {
+    const merge = req.query.merge !== 'false' && req.body?.merge !== false;
+    const payload = req.body?.snapshot || req.body;
+    const result = db.importSnapshot(payload, { merge });
+
+    // Schedule all restored active targets in MonitorService
+    const allTargets = db.getEnrichedTargets();
+    for (const t of allTargets) {
+      monitor.onTargetUpdated(t);
+    }
+
+    telegramBot.restart();
+    broadcast({
+      type: 'INIT',
+      data: {
+        targets: allTargets,
+        settings: maskSettings(db.getSettings()),
+        logs: db.getLogs(50),
+        serverTime: new Date().toISOString()
+      }
+    });
+
+    res.json({ success: true, ...result, totalTargets: allTargets.length });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

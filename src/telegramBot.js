@@ -281,6 +281,10 @@ class TelegramBotService {
       return this.handleKeepAliveCommand(token, chatId, arg1);
     }
 
+    if (cmd === '/backupdb' || cmd === '/exportdb') {
+      return this.handleBackupDbCommand(token, chatId);
+    }
+
     if (cmd === '/anonyig' || cmd === '/backup' || cmd === '/anon' || cmd === '/mirror') {
       if (!arg1) {
         return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/anonyig yam.wzzz</code>');
@@ -434,6 +438,7 @@ class TelegramBotService {
       `🧪 <b>Testing Tools:</b>`,
       `• <code>/flip &lt;username&gt;</code> - Test Public ⇄ Private siren alert with media buttons`,
       `• <code>/stats</code> - Server uptime & statistics`,
+      `• <code>/backupdb</code> - Export JSON backup of tracked targets & settings to Telegram`,
       `• <code>/keepalive [url]</code> - Keep Render server awake 24/7 (anti-sleep)`,
       ``,
       `💡 <i>Tip: You can also just type any username (e.g. <code>@yam.wzzz</code>) to inspect it instantly!</i>`
@@ -1449,6 +1454,35 @@ class TelegramBotService {
       chatId,
       `⚡ <b>Test Transition Dispatched!</b>\n@${clean}: <b>${current.toUpperCase()}</b> ➔ <b>${newStatus.toUpperCase()}</b>\nAudio siren + alerts fired!`
     );
+  }
+
+  async handleBackupDbCommand(token, chatId) {
+    await this.sendChatAction(token, chatId, 'upload_document');
+    const tmpDir = path.join(config.CACHE_DIR, '.tmp_dl');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const fileName = `ig-radar-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    const filePath = path.join(tmpDir, `${Date.now()}_${fileName}`);
+
+    try {
+      const snapshot = db.exportSnapshot({ includeSecrets: false });
+      fs.writeFileSync(filePath, JSON.stringify(snapshot, null, 2), 'utf-8');
+      const caption = [
+        `💾 <b>IG Radar Database Backup</b>`,
+        `• Tracked Targets: <b>${snapshot.targets.length}</b>`,
+        `• Exported At: <code>${snapshot.exportedAt}</code>`,
+        `• Secrets Redacted: <b>Yes (Safe to store)</b>`,
+        ``,
+        `<i>Restore anytime via Settings → Restore Backup (.json) on the dashboard!</i>`
+      ].join('\n');
+
+      await this.sendDocument(token, chatId, filePath, caption);
+    } catch (err) {
+      await this.sendMessage(token, chatId, `❌ Failed exporting database backup: ${escapeHtml(err.message)}`);
+    } finally {
+      if (fs.existsSync(filePath)) {
+        try { fs.unlinkSync(filePath); } catch (e) {}
+      }
+    }
   }
 
   async handleKeepAliveCommand(token, chatId, newUrl = null) {

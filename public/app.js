@@ -148,12 +148,14 @@ const clearCacheBtn = document.getElementById('clearCacheBtn');
 const selectAllCheckbox = document.getElementById('selectAllCheckbox');
 const autoDeleteTempCheckbox = document.getElementById('autoDeleteTempCheckbox');
 const selectionSummaryText = document.getElementById('selectionSummaryText');
+const liveHighlightsBar = document.getElementById('liveHighlightsBar');
 const liveMediaStreamGrid = document.getElementById('liveMediaStreamGrid');
 const sessionDot = document.getElementById('sessionDot');
 const sessionStatusText = document.getElementById('sessionStatusText');
 
 // Cache State
 let activeCacheUsername = '';
+let activeTempMode = 'manifest'; // 'manifest' (2-phase zero-disk) | 'cache' (legacy)
 let cachedMediaItems = [];
 let selectedMediaIds = new Set();
 
@@ -955,15 +957,17 @@ async function downloadSingleCachedItem(username, itemId) {
   const targetItem = cachedMediaItems.find(i => i.id === itemId);
   const card = document.querySelector(`.media-stream-card[data-id="${itemId}"]`);
   const btn = card?.querySelector('.single-download-btn');
-  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : true;
   if (btn) {
     btn.disabled = true;
-    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Downloading...</span>';
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Streaming...</span>';
   }
 
   try {
-    const query = autoDelete ? '?autoDelete=true' : '';
-    const downloadUrl = `/api/cache/download/${encodeURIComponent(username)}/${encodeURIComponent(itemId)}${query}`;
+    const downloadUrl = activeTempMode === 'manifest'
+      ? `/api/temp/download/${encodeURIComponent(username)}/${encodeURIComponent(itemId)}`
+      : `/api/cache/download/${encodeURIComponent(username)}/${encodeURIComponent(itemId)}${autoDelete ? '?autoDelete=true' : ''}`;
+
     const link = document.createElement('a');
     link.href = downloadUrl;
     link.download = targetItem?.fileName || 'media';
@@ -971,17 +975,15 @@ async function downloadSingleCachedItem(username, itemId) {
     link.click();
     document.body.removeChild(link);
 
-    showToast(`Downloading ${targetItem?.fileName || 'media file'}${autoDelete ? ' (will auto-clean temp file)' : ''}...`, 'info');
+    showToast(`Downloading ${targetItem?.fileName || 'media file'} (auto-cleaned on server)...`, 'info');
 
-    if (!autoDelete) {
-      setTimeout(() => {
-        if (btn) {
-          btn.disabled = false;
-          btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
-          btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
-        }
-      }, 600);
-    }
+    setTimeout(() => {
+      if (btn) {
+        btn.disabled = false;
+        btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
+        btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
+      }
+    }, 600);
   } catch (err) {
     showToast(`Download failed: ${err.message}`, 'error');
     if (btn) {
@@ -993,21 +995,34 @@ async function downloadSingleCachedItem(username, itemId) {
 
 async function downloadAllTempCachedItems() {
   if (!activeCacheUsername || cachedMediaItems.length === 0) return;
-  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : true;
   const count = cachedMediaItems.length;
 
   if (downloadAllTempZipBtn) {
     downloadAllTempZipBtn.disabled = true;
-    downloadAllTempZipBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Streaming ZIP...</span>';
+    downloadAllTempZipBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Fetching & Zipping...</span>';
   }
 
   try {
-    showToast(`Streaming all ${count} temporary files as ZIP${autoDelete ? ' (auto-cleaning after transfer)' : ''}...`, 'info');
-    const query = autoDelete ? '?autoDelete=true' : '';
-    const res = await fetch(`/api/cache/download-all/${encodeURIComponent(activeCacheUsername)}${query}`);
+    showToast(`Downloading ${count} items in parallel & streaming temporary ZIP...`, 'info');
+    let res;
+    if (activeTempMode === 'manifest') {
+      res = await fetch('/api/temp/download-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: activeCacheUsername, all: true })
+      });
+    } else {
+      const query = autoDelete ? '?autoDelete=true' : '';
+      res = await fetch(`/api/cache/download-all/${encodeURIComponent(activeCacheUsername)}${query}`);
+    }
+
     if (!res.ok) {
-      const errText = await res.text().catch(() => 'ZIP creation failed');
-      throw new Error(errText || 'Failed to download full ZIP');
+      const ct = res.headers.get('content-type') || '';
+      const errMsg = ct.includes('application/json')
+        ? (await res.json().catch(() => ({}))).error
+        : await res.text().catch(() => '');
+      throw new Error(errMsg || `Failed to create ZIP (HTTP ${res.status})`);
     }
 
     const blob = await res.blob();
@@ -1020,7 +1035,7 @@ async function downloadAllTempCachedItems() {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
 
-    showToast(`✅ Downloaded all ${count} files!${autoDelete ? ' Temporary files cleared.' : ''}`, 'success');
+    showToast(`✅ Downloaded all ${count} files! Server temp files automatically purged.`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -1036,7 +1051,7 @@ async function downloadSelectedCachedItems() {
 
   const count = selectedMediaIds.size;
   const ids = Array.from(selectedMediaIds);
-  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : true;
 
   if (downloadSelectedZipBtn) {
     downloadSelectedZipBtn.disabled = true;
@@ -1044,9 +1059,10 @@ async function downloadSelectedCachedItems() {
   }
 
   try {
-    showToast(`Packaging ${count} selected media files into ZIP...`, 'info');
+    showToast(`Downloading ${count} selected files in parallel into temporary ZIP...`, 'info');
 
-    const res = await fetch('/api/cache/download-selected', {
+    const endpoint = activeTempMode === 'manifest' ? '/api/temp/download-zip' : '/api/cache/download-selected';
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1057,7 +1073,7 @@ async function downloadSelectedCachedItems() {
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'ZIP creation failed' }));
+      const err = await res.json().catch(() => ({ error: `ZIP creation failed (HTTP ${res.status})` }));
       throw new Error(err.error || 'Failed to download selected ZIP');
     }
 
@@ -1071,19 +1087,16 @@ async function downloadSelectedCachedItems() {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
 
-    if (!autoDelete) {
-      // Keep all cards on screen; mark them with green Downloaded state
-      ids.forEach(id => {
-        const card = document.querySelector(`.media-stream-card[data-id="${id}"]`);
-        const btn = card?.querySelector('.single-download-btn');
-        if (btn) {
-          btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
-          btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
-        }
-      });
-    }
+    ids.forEach(id => {
+      const card = document.querySelector(`.media-stream-card[data-id="${id}"]`);
+      const btn = card?.querySelector('.single-download-btn');
+      if (btn) {
+        btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
+        btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
+      }
+    });
 
-    showToast(`✅ Downloaded ${count} items!${autoDelete ? ' Temporary files purged from server.' : ' Media remains accessible while you are on site.'}`, 'success');
+    showToast(`✅ Downloaded ${count} items! Temporary files immediately cleared from server.`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -1147,6 +1160,62 @@ if (clearCacheBtn) {
   });
 }
 
+function renderLiveHighlightsStrip(username, highlights = []) {
+  if (!liveHighlightsBar) return;
+  if (!Array.isArray(highlights) || highlights.length === 0) {
+    liveHighlightsBar.classList.add('hidden');
+    liveHighlightsBar.innerHTML = '';
+    return;
+  }
+
+  liveHighlightsBar.classList.remove('hidden');
+  liveHighlightsBar.innerHTML = `
+    <span class="text-[11px] font-bold text-amber-400 flex items-center space-x-1 mr-1">
+      <i class="fa-solid fa-star"></i>
+      <span>Highlights (${highlights.length}) — click to load on demand:</span>
+    </span>
+  `;
+
+  for (const hl of highlights) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'px-2.5 py-1 rounded-full bg-amber-500/10 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[11px] font-semibold transition flex items-center space-x-1.5';
+    btn.innerHTML = `<i class="fa-solid fa-circle-play text-[10px]"></i><span>${escapeHtml(hl.title || 'Highlight')}</span>`;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-[10px]"></i><span>Loading ${escapeHtml(hl.title || 'Highlight')}...</span>`;
+      try {
+        const res = await fetch('/api/temp/highlight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, highlightId: hl.id, highlightTitle: hl.title })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed loading highlight');
+        const hlItems = data.items || [];
+        if (hlItems.length > 0) {
+          for (const item of hlItems) {
+            appendLiveMediaCard({ item, username, current: cachedMediaItems.length + 1, total: cachedMediaItems.length + hlItems.length }, false, true);
+          }
+          updateSelectionUI();
+          btn.className = 'px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px] font-semibold flex items-center space-x-1.5';
+          btn.innerHTML = `<i class="fa-solid fa-check text-[10px]"></i><span>${escapeHtml(hl.title)} (${hlItems.length})</span>`;
+          showToast(`✨ Loaded ${hlItems.length} items from highlight "${hl.title}"`, 'success');
+        } else {
+          btn.disabled = false;
+          btn.innerHTML = `<i class="fa-solid fa-circle-exclamation text-[10px]"></i><span>${escapeHtml(hl.title)} (0)</span>`;
+          showToast(`No items returned for highlight "${hl.title}" (try Backup Viewer for private/restricted highlights).`, 'info');
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-circle-play text-[10px]"></i><span>${escapeHtml(hl.title || 'Highlight')}</span>`;
+        showToast(err.message, 'error');
+      }
+    });
+    liveHighlightsBar.appendChild(btn);
+  }
+}
+
 if (liveDownloadForm) {
   liveDownloadForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1155,24 +1224,26 @@ if (liveDownloadForm) {
 
     stopLivePoll();
     activeCacheUsername = username;
+    activeTempMode = 'manifest';
     cachedMediaItems = [];
     selectedMediaIds.clear();
     updateSelectionUI();
     notifyViewingCache(username);
+    renderLiveHighlightsStrip(username, []);
 
     startLiveDownloadBtn.disabled = true;
-    startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Downloading to Temp Cache...';
+    startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Instant Inspect...';
     liveDownloadStatusBox.classList.remove('hidden');
     liveMediaStreamGrid.innerHTML = '';
-    liveStatusText.textContent = `Connecting to Instagram and streaming @${username} into temporary cache...`;
+    liveStatusText.textContent = `Scanning @${username} (zero-disk instant preview)...`;
     liveItemCounter.textContent = '0 items';
     if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping';
 
     try {
-      const res = await fetch('/api/cache/inspect', {
+      const res = await fetch('/api/temp/inspect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, async: true })
+        body: JSON.stringify({ username })
       });
 
       const contentType = res.headers.get('content-type') || '';
@@ -1180,41 +1251,19 @@ if (liveDownloadForm) {
         ? await res.json()
         : { error: `Server returned HTTP ${res.status}` };
 
-      if (!res.ok) throw new Error(data.error || `Live download failed (HTTP ${res.status})`);
+      if (!res.ok) throw new Error(data.error || `Inspect failed (HTTP ${res.status})`);
 
-      if (data.async) {
-        // Non-blocking background job started (immune to Render/proxy HTTP timeouts).
-        // WebSocket pushes items live; fallback poller syncs every 2.5s in case WS reconnects.
-        livePollTimer = setInterval(async () => {
-          if (activeCacheUsername !== username) {
-            stopLivePoll();
-            return;
-          }
-          try {
-            const stRes = await fetch(`/api/cache/status/${encodeURIComponent(username)}`);
-            if (!stRes.ok) return;
-            const st = await stRes.json();
-            if (Array.isArray(st.items) && st.items.length > 0) {
-              for (const item of st.items) {
-                appendLiveMediaCard({ item, username, current: st.items.length, total: st.items.length }, false, true);
-              }
-            }
-            if (st.status === 'completed') {
-              finishLiveDownloadUI(username, st.items, st.summary);
-            } else if (st.status === 'failed') {
-              stopLivePoll();
-              startLiveDownloadBtn.disabled = false;
-              startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> <span>Live Download Profile</span>';
-              liveStatusText.textContent = `❌ ${st.error || 'Download failed'}`;
-              if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
-              showToast(st.error || 'Download failed', 'error');
-            }
-          } catch (pollErr) {
-            // transient network hiccup; retry next tick
-          }
-        }, 2500);
-      } else {
-        finishLiveDownloadUI(username, data.items, data.summary);
+      const manifest = data.manifest || {};
+      renderLiveHighlightsStrip(username, manifest.highlights || []);
+      finishLiveDownloadUI(username, manifest.items || [], {
+        durationMs: manifest.durationMs,
+        itemsPerSec: manifest.durationMs > 0 ? Number(((manifest.items?.length || 0) / (manifest.durationMs / 1000)).toFixed(1)) : 0,
+        isPrivate: manifest.isPrivate,
+        errors: manifest.errors
+      });
+
+      if ((manifest.items?.length || 0) > 0) {
+        showToast(`⚡ Instant preview ready for @${username} (${manifest.items.length} items in ${(manifest.durationMs / 1000).toFixed(1)}s)!`, 'success');
       }
     } catch (err) {
       stopLivePoll();
@@ -1506,6 +1555,38 @@ testDiscordBtn.addEventListener('click', async () => {
     discordFeedback.innerHTML = `❌ Connection error: ${err.message}`;
   }
 });
+
+// Database Backup Restore Handler
+const importBackupBtn = document.getElementById('importBackupBtn');
+const importBackupFileInput = document.getElementById('importBackupFileInput');
+
+if (importBackupBtn && importBackupFileInput) {
+  importBackupBtn.addEventListener('click', () => importBackupFileInput.click());
+  importBackupFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    importBackupBtn.disabled = true;
+    importBackupBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Restoring...</span>';
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const res = await fetch('/api/backup/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Backup restore failed');
+      showToast(`✅ Restored ${data.addedTargets} target(s) (${data.skippedTargets} skipped)!`, 'success');
+    } catch (err) {
+      showToast(`Restore failed: ${err.message}`, 'error');
+    } finally {
+      importBackupFileInput.value = '';
+      importBackupBtn.disabled = false;
+      importBackupBtn.innerHTML = '<i class="fa-solid fa-file-import"></i> <span>Restore Backup (.json)</span>';
+    }
+  });
+}
 
 // --- Toast Notifications ---
 function showToast(message, type = 'info') {

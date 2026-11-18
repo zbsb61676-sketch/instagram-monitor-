@@ -1742,8 +1742,425 @@ async function fetchHighlights(username, options = {}) {
   return result;
 }
 
+/**
+ * Phase 1: Instant Zero-Disk Profile Media Inspector (~1-2s)
+ * Fetches profile metadata, post/reel media URLs, and highlight reel directory
+ * WITHOUT writing any media files to disk. Media is downloaded on demand only
+ * when the user clicks Download or ZIP.
+ */
+async function inspectProfileMedia(username, options = {}) {
+  const startedAt = Date.now();
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  if (!clean) throw new Error('Invalid username format');
+
+  const manifest = {
+    username: clean,
+    source: 'instagram',
+    isPrivate: false,
+    profile: { fullName: '', bio: '', userId: null, avatarUrl: null },
+    highlights: [],
+    items: [],
+    errors: [],
+    durationMs: 0
+  };
+
+  let html = '';
+  let scripts = [];
+  let allMedia = [];
+  let stage1Blocked = false;
+  const profileCookie = formatCookieHeader(options.sessionCookie);
+
+  // Stage 1: Direct Instagram Profile HTML
+  const profileUrl = `https://www.instagram.com/${clean}/`;
+  const profileHeaders = getBrowserHeaders();
+  if (profileCookie) profileHeaders['Cookie'] = profileCookie;
+
+  try {
+    let { response: res } = await httpFetch(profileUrl, {
+      method: 'GET',
+      headers: profileHeaders,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(12000)
+    }, { proxyUrl: options.proxyUrl });
+
+    if (profileCookie && isLoginWallResponse(res)) {
+      const retry = await httpFetch(profileUrl, {
+        method: 'GET',
+        headers: getBrowserHeaders(),
+        redirect: 'follow',
+        signal: AbortSignal.timeout(12000)
+      }, { proxyUrl: options.proxyUrl });
+      res = retry.response;
+    }
+
+    if (res.status === 404) {
+      throw new Error(`Account @${clean} does not exist (HTTP 404)`);
+    }
+
+    if (res.ok) {
+      html = await res.text();
+      if (isLoginWallResponse(res, html)) {
+        stage1Blocked = true;
+        html = '';
+      } else {
+        if (/this account is private|follow to see their photos and videos/i.test(html)) {
+          manifest.isPrivate = true;
+        }
+        const details = extractProfileDetails(html, clean);
+        manifest.profile = {
+          fullName: details.fullName || '',
+          bio: details.bio || '',
+          userId: details.userId || null,
+          avatarUrl: details.avatarUrl || null
+        };
+        scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+        for (const scriptContent of scripts) {
+          if (scriptContent.includes('display_uri') || scriptContent.includes('display_url') || scriptContent.includes('video_url') || scriptContent.includes('carousel') || scriptContent.includes('edge_owner_to_timeline_media')) {
+            try {
+              const parsed = JSON.parse(scriptContent);
+              allMedia.push(...extractMediaObjects(parsed));
+            } catch (e) {}
+          }
+        }
+      }
+    } else {
+      stage1Blocked = true;
+      manifest.errors.push(`Instagram HTML returned HTTP ${res.status}`);
+    }
+  } catch (err) {
+    if (err.message && err.message.includes('HTTP 404')) throw err;
+    stage1Blocked = true;
+    manifest.errors.push(err.message);
+  }
+
+  // Stage 2: Instagram Web Profile Info API Fallback
+  if ((stage1Blocked || allMedia.length === 0) && !manifest.isPrivate) {
+    try {
+      const apiUrl = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(clean)}`;
+      const { response: apiRes } = await httpFetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'X-IG-App-ID': '936619743392459',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': '*/*',
+          'Referer': `https://www.instagram.com/${clean}/`,
+          ...(profileCookie ? { 'Cookie': profileCookie } : {})
+        },
+        signal: AbortSignal.timeout(10000)
+      }, { proxyUrl: options.proxyUrl });
+
+      if (apiRes.ok) {
+        const apiData = await apiRes.json();
+        const user = apiData?.data?.user;
+        if (user) {
+          manifest.source = 'instagram_api';
+          manifest.profile.userId = manifest.profile.userId || (user.id ? String(user.id) : null);
+          manifest.profile.avatarUrl = manifest.profile.avatarUrl || user.profile_pic_url_hd || user.profile_pic_url || null;
+          manifest.profile.fullName = manifest.profile.fullName || user.full_name || '';
+          manifest.profile.bio = manifest.profile.bio || user.biography || '';
+          if (user.is_private === true) manifest.isPrivate = true;
+
+          const edges = user.edge_owner_to_timeline_media?.edges || [];
+          for (const edge of edges) {
+            const node = edge?.node;
+            if (!node) continue;
+            const code = node.shortcode || String(node.id);
+            const captionText = node.edge_media_to_caption?.edges?.[0]?.node?.text || '';
+            const sidecarEdges = node.edge_sidecar_to_children?.edges || [];
+            const preloadedSlides = sidecarEdges.map((se, i) => ({
+              index: i + 1,
+              id: String(se.node?.id || `${code}_${i + 1}`),
+              isVideo: Boolean(se.node?.is_video && se.node?.video_url),
+              url: (se.node?.is_video && se.node?.video_url) ? se.node.video_url : se.node?.display_url,
+              displayUrl: se.node?.display_url || null
+            })).filter(s => Boolean(s.url));
+
+            allMedia.push({
+              pk: String(node.id || code),
+              code: String(code),
+              displayUrl: node.display_url || null,
+              videoUrl: node.video_url || null,
+              isVideo: Boolean(node.is_video),
+              isCarousel: preloadedSlides.length > 1,
+              carouselCount: preloadedSlides.length,
+              preloadedSlides: preloadedSlides.length > 1 ? preloadedSlides : null,
+              caption: captionText
+            });
+          }
+        }
+      }
+    } catch (apiErr) {
+      manifest.errors.push(`Web API fallback: ${apiErr.message}`);
+    }
+  }
+
+  // Stage 3: Anonymous Public Mirror Fallback
+  if (allMedia.length === 0 && !manifest.isPrivate && stage1Blocked) {
+    try {
+      const mirrorRes = await anonyigProvider.fetchPublicMirrorMedia(clean);
+      if (mirrorRes && mirrorRes.success && Array.isArray(mirrorRes.items) && mirrorRes.items.length > 0) {
+        manifest.source = `mirror_${mirrorRes.provider || 'public'}`;
+        mirrorRes.items.forEach((m, idx) => {
+          if (m.url) {
+            allMedia.push({
+              pk: `mirror_${idx + 1}`,
+              code: `mirror_${idx + 1}`,
+              displayUrl: m.url,
+              videoUrl: null,
+              isVideo: false,
+              isCarousel: false,
+              caption: `Public post via ${mirrorRes.provider || 'mirror'}`
+            });
+          }
+        });
+      }
+    } catch (mirrorErr) {
+      manifest.errors.push(`Mirror fallback: ${mirrorErr.message}`);
+    }
+  }
+
+  // Build deduplicated item manifest (with proxied preview URLs for instant browser rendering)
+  const makeProxyUrl = (u) => u ? `/api/media-proxy?url=${encodeURIComponent(u)}` : '';
+
+  if (manifest.profile.avatarUrl) {
+    manifest.items.push({
+      id: `avatar_${clean}`,
+      code: 'avatar',
+      type: 'profile_pic',
+      fileName: `${clean}_avatar.jpg`,
+      mediaUrl: manifest.profile.avatarUrl,
+      thumbnailUrl: makeProxyUrl(manifest.profile.avatarUrl),
+      fileUrl: makeProxyUrl(manifest.profile.avatarUrl),
+      isVideo: false,
+      caption: `${manifest.profile.fullName || clean} Profile Picture`
+    });
+  }
+
+  const seenKeys = new Set();
+  for (const post of allMedia) {
+    const key = post.code || post.pk;
+    if (!key || seenKeys.has(key)) continue;
+    seenKeys.add(key);
+
+    if (Array.isArray(post.preloadedSlides) && post.preloadedSlides.length > 0) {
+      for (const slide of post.preloadedSlides) {
+        const ext = slide.isVideo ? 'mp4' : 'jpg';
+        const thumb = slide.displayUrl || slide.url;
+        manifest.items.push({
+          id: `${post.code}_slide_${slide.index}`,
+          code: post.code,
+          slideIndex: slide.index,
+          totalSlides: post.preloadedSlides.length,
+          type: slide.isVideo ? 'carousel_video_slide' : 'carousel_slide',
+          fileName: `${post.code}_slide_${slide.index}.${ext}`,
+          mediaUrl: slide.url,
+          thumbnailUrl: makeProxyUrl(thumb),
+          fileUrl: makeProxyUrl(slide.url),
+          isVideo: Boolean(slide.isVideo),
+          caption: `${post.caption ? post.caption + ' ' : ''}(Slide ${slide.index}/${post.preloadedSlides.length})`
+        });
+      }
+    } else {
+      const isVideoWithSource = Boolean(post.isVideo && post.videoUrl);
+      const mediaUrl = isVideoWithSource ? post.videoUrl : post.displayUrl;
+      if (!mediaUrl) continue;
+      const thumbUrl = post.displayUrl || mediaUrl;
+      const ext = isVideoWithSource ? 'mp4' : 'jpg';
+      manifest.items.push({
+        id: String(post.pk || post.code),
+        code: String(post.code || post.pk),
+        type: isVideoWithSource ? 'video_post' : 'photo_post',
+        fileName: `${post.code || post.pk}.${ext}`,
+        mediaUrl,
+        thumbnailUrl: makeProxyUrl(thumbUrl),
+        fileUrl: makeProxyUrl(mediaUrl),
+        isVideo: isVideoWithSource,
+        caption: post.caption || ''
+      });
+    }
+  }
+
+  // Discover highlight reel headers (downloaded on demand when user selects a reel!)
+  const discoveredHighlights = extractHighlightsFromScripts(scripts);
+  manifest.highlights = discoveredHighlights.map(h => ({
+    id: h.id,
+    title: h.title || 'Highlight',
+    coverUrl: h.coverUrl || null,
+    previewUrl: makeProxyUrl(h.coverUrl)
+  }));
+
+  manifest.durationMs = Date.now() - startedAt;
+  cacheManager.setInspectManifest(clean, manifest);
+  return manifest;
+}
+
+/**
+ * Inspect media items inside a single highlight reel on demand (zero disk writes).
+ */
+async function inspectHighlightReel(username, highlightId, highlightTitle = 'Highlight', options = {}) {
+  const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
+  const hlId = String(highlightId || '').replace(/^highlight:/, '');
+  if (!clean || !hlId) return [];
+
+  const cookieHeader = formatCookieHeader(options.sessionCookie || db.getSettings().sessionCookie);
+  const csrfMatch = cookieHeader ? cookieHeader.match(/csrftoken=([^;]+)/) : null;
+  const csrf = csrfMatch ? csrfMatch[1] : '';
+  let reelItems = [];
+
+  // Try Web SSR -> Mobile Reels -> Web Reels
+  try {
+    const { response: res } = await httpFetch(`https://www.instagram.com/stories/highlights/${hlId}/`, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+        ...(csrf ? { 'X-CSRFToken': csrf } : {}),
+        'X-IG-App-ID': '936619743392459'
+      },
+      signal: AbortSignal.timeout(12000)
+    }, { proxyUrl: options.proxyUrl });
+
+    if (res.ok) {
+      const html = await res.text();
+      const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+      for (const sc of scripts) {
+        if (sc.includes('items') || sc.includes('reels_media')) {
+          try {
+            const parsed = JSON.parse(sc);
+            function scan(obj, depth = 0) {
+              if (!obj || typeof obj !== 'object' || depth > 15 || reelItems.length > 0) return;
+              if (Array.isArray(obj.reels_media)) {
+                for (const rm of obj.reels_media) {
+                  if (Array.isArray(rm.items) && rm.items.length > 0) { reelItems = rm.items; return; }
+                }
+              }
+              if (Array.isArray(obj.edges)) {
+                for (const e of obj.edges) {
+                  if (e.node && Array.isArray(e.node.items) && e.node.items.length > 0) { reelItems = e.node.items; return; }
+                }
+              }
+              if (Array.isArray(obj.items) && obj.items.length > 0 && (obj.items[0].video_versions || obj.items[0].image_versions2)) {
+                reelItems = obj.items; return;
+              }
+              for (const k of Object.keys(obj)) {
+                if (reelItems.length > 0) break;
+                if (typeof obj[k] === 'object') scan(obj[k], depth + 1);
+              }
+            }
+            scan(parsed);
+            if (reelItems.length > 0) break;
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+
+  if (reelItems.length === 0) {
+    try {
+      const { response: mobRes } = await httpFetch(`https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=highlight:${hlId}`, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Instagram 320.0.0.35.109 Android (33/13; 480dpi; 1080x2400; samsung; SM-G998B; p3s; exynos2100; en_US)',
+          'X-IG-App-ID': '936619743392459',
+          ...(cookieHeader ? { 'Cookie': cookieHeader } : {})
+        },
+        signal: AbortSignal.timeout(10000)
+      }, { proxyUrl: options.proxyUrl });
+      if (mobRes.ok) {
+        const mobData = await mobRes.json();
+        const reel = mobData?.reels?.[`highlight:${hlId}`] || mobData?.reels?.[hlId];
+        if (Array.isArray(reel?.items)) reelItems = reel.items;
+      }
+    } catch (e) {}
+  }
+
+  const makeProxyUrl = (u) => u ? `/api/media-proxy?url=${encodeURIComponent(u)}` : '';
+  const mapped = [];
+  for (let idx = 0; idx < reelItems.length; idx++) {
+    const item = reelItems[idx];
+    const rawId = String(item.pk || item.id || idx).split('_')[0];
+    const isVideo = (item.media_type === 2 || item.is_video === true) && (item.video_versions?.length > 0 || item.video_resources?.length > 0 || item.video_url);
+    const videoUrl = item.video_versions?.[0]?.url || item.video_resources?.[0]?.src || item.video_url || null;
+    const photoCandidate = item.image_versions2?.candidates?.[0]?.url ||
+                           item.display_resources?.[item.display_resources.length - 1]?.src ||
+                           item.display_url || item.display_uri || null;
+    const mediaUrl = isVideo ? videoUrl : photoCandidate;
+    if (!mediaUrl) continue;
+    const cleanUrl = mediaUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const cleanThumb = (photoCandidate || mediaUrl).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const ext = isVideo ? 'mp4' : 'jpg';
+
+    mapped.push({
+      id: `highlight_${hlId}_${rawId}`,
+      code: rawId,
+      highlightId: hlId,
+      highlightTitle,
+      type: isVideo ? 'highlight_video' : 'highlight_photo',
+      fileName: `${hlId}_${rawId}.${ext}`,
+      mediaUrl: cleanUrl,
+      thumbnailUrl: makeProxyUrl(cleanThumb),
+      fileUrl: makeProxyUrl(cleanUrl),
+      isVideo: Boolean(isVideo),
+      caption: `Highlight: ${highlightTitle}`
+    });
+  }
+
+  // Merge into existing in-memory manifest so /api/temp/download & /api/temp/download-zip can serve them on demand
+  const manifest = cacheManager.getInspectManifest(clean);
+  if (manifest && mapped.length > 0) {
+    const existingIds = new Set(manifest.items.map(i => i.id));
+    for (const m of mapped) {
+      if (!existingIds.has(m.id)) {
+        manifest.items.push(m);
+      }
+    }
+    cacheManager.setInspectManifest(clean, manifest);
+  }
+
+  return mapped;
+}
+
+/**
+ * Phase 2: Download ONLY the requested items into an isolated temporary directory
+ * concurrently (bounded by DOWNLOAD_CONCURRENCY) for immediate streaming + cleanup.
+ */
+async function downloadItemsToTempDir(items, tempDir, options = {}) {
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+  const concurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
+  const dlOptions = { ...options, force: true, _limiter: createLimiter(concurrency) };
+  const downloaded = [];
+
+  await runWithConcurrency(items, concurrency, async (item, idx) => {
+    const url = item?.mediaUrl;
+    if (!url) return;
+    const safeName = (item.fileName || `media_${idx + 1}.${item.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const destPath = path.join(tempDir, `${idx + 1}_${safeName}`);
+    try {
+      const ok = await downloadFile(url, destPath, dlOptions);
+      if (ok && fs.existsSync(destPath)) {
+        downloaded.push({
+          ...item,
+          filePath: destPath,
+          entryName: safeName
+        });
+      }
+    } catch (e) {
+      // skip individual broken CDN URL without failing the entire ZIP
+    }
+  });
+
+  return downloaded;
+}
+
 module.exports = {
   downloadTargetContent,
+  inspectProfileMedia,
+  inspectHighlightReel,
+  downloadItemsToTempDir,
   downloadFile,
   runWithConcurrency,
   fetchPostSlides,

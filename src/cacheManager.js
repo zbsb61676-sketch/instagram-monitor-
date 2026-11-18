@@ -22,12 +22,40 @@ class CacheManager {
   constructor(cacheDir = config.CACHE_DIR) {
     this.cacheDir = cacheDir;
     this.cacheIndex = new Map(); // username -> Array<item>
+    this.inspectManifests = new Map(); // username -> { manifest, expiresAt }
     this.flushTimers = new Map(); // username -> NodeJS.Timeout
     this.dirReady = new Set(); // usernames whose subfolders already exist
     if (!fs.existsSync(this.cacheDir)) {
       fs.mkdirSync(this.cacheDir, { recursive: true });
     }
     this.init();
+  }
+
+  setInspectManifest(username, manifest, ttlMs = config.MAX_CACHE_AGE_MS || 30 * 60 * 1000) {
+    const clean = cleanHandle(username);
+    if (!clean || !manifest) return null;
+    this.inspectManifests.set(clean, {
+      manifest,
+      expiresAt: Date.now() + ttlMs
+    });
+    return manifest;
+  }
+
+  getInspectManifest(username) {
+    const clean = cleanHandle(username);
+    if (!clean) return null;
+    const entry = this.inspectManifests.get(clean);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.inspectManifests.delete(clean);
+      return null;
+    }
+    return entry.manifest;
+  }
+
+  clearInspectManifest(username) {
+    const clean = cleanHandle(username);
+    if (clean) this.inspectManifests.delete(clean);
   }
 
   init() {
@@ -207,6 +235,7 @@ class CacheManager {
       this.flushTimers.delete(clean);
     }
     this.cacheIndex.delete(clean);
+    this.inspectManifests.delete(clean);
     this.dirReady.delete(clean);
     const userDir = path.join(this.cacheDir, clean);
     if (fs.existsSync(userDir)) {
@@ -223,6 +252,7 @@ class CacheManager {
     }
     this.flushTimers.clear();
     this.cacheIndex.clear();
+    this.inspectManifests.clear();
     this.dirReady.clear();
     if (fs.existsSync(this.cacheDir)) {
       try {

@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const WebSocket = require('ws');
+const { isAllowedMediaProxyUrl } = require('../src/httpClient');
 
 function startServer(envOverrides = {}) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ig-mon-srv-'));
@@ -148,5 +149,36 @@ describe('Server HTTP, WebSocket & Auth Integration', () => {
     const statusJson = await statusRes.json();
     assert.equal(statusJson.status, 'idle');
     assert.equal(statusJson.count, 0);
+
+    // Verify SSRF protection on /api/media-proxy
+    assert.equal(isAllowedMediaProxyUrl('https://scontent-bom1-1.cdninstagram.com/v/t51.jpg'), true);
+    assert.equal(isAllowedMediaProxyUrl('https://instagram.fbom3-1.fna.fbcdn.net/pic.jpg'), true);
+    assert.equal(isAllowedMediaProxyUrl('http://127.0.0.1:3000/api/settings'), false);
+    assert.equal(isAllowedMediaProxyUrl('https://169.254.169.254/latest/meta-data/'), false);
+    assert.equal(isAllowedMediaProxyUrl('https://evil.example/steal'), false);
+
+    const ssrfRes = await fetch(`${srv.baseUrl}/api/media-proxy?url=${encodeURIComponent('http://127.0.0.1:3000/health')}`, { headers });
+    assert.equal(ssrfRes.status, 400);
+
+    // Verify Backup Export & Import end-to-end
+    const importRes = await fetch(`${srv.baseUrl}/api/backup/import`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        targets: [
+          { username: 'restored_one', intervalSec: 15, isMonitoring: false },
+          { username: 'restored_two', intervalSec: 30, isMonitoring: false }
+        ]
+      })
+    });
+    assert.equal(importRes.status, 200);
+    const importJson = await importRes.json();
+    assert.equal(importJson.addedTargets, 2);
+
+    const exportRes = await fetch(`${srv.baseUrl}/api/backup/export`, { headers });
+    assert.equal(exportRes.status, 200);
+    const exported = await exportRes.json();
+    assert.equal(exported.targets.length, 2);
+    assert.equal(exported.settings.telegramToken, undefined);
   });
 });

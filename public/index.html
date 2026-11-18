@@ -236,7 +236,7 @@
             <span>Instant Profile Downloader & Live Media Viewer</span>
           </h3>
           <p class="text-xs text-gray-400 mt-0.5">
-            Instantly inspect any Instagram ID, download all posts, reels, photos, and stories with live real-time progress and direct download buttons.
+            Instant zero-disk preview (~1–2s), on-demand highlight loading, and blazing-fast temporary downloads that auto-delete immediately after transfer.
           </p>
         </div>
         <div id="sessionCookieIndicator" class="flex items-center space-x-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-gray-800 text-gray-400 border border-gray-700 self-start sm:self-auto">
@@ -312,8 +312,13 @@
           </div>
           <div class="text-[11px] text-amber-400/90 flex items-center space-x-1.5">
             <i class="fa-solid fa-shield-halved text-amber-400"></i>
-            <span>Parallel high-speed temp staging • Auto-purged when downloaded or when you leave.</span>
+            <span>2-Phase Instant Preview • Zero disk used until you download • Temp files auto-deleted right after transfer.</span>
           </div>
+        </div>
+
+        <!-- On-Demand Highlight Reels Strip (Hidden until highlights discovered) -->
+        <div id="liveHighlightsBar" class="hidden flex flex-wrap items-center gap-2 pt-1 pb-1 border-b border-gray-800/80">
+          <!-- Clickable highlight reel pills rendered dynamically -->
         </div>
 
         <!-- Realtime Media Stream Container -->
@@ -553,6 +558,37 @@
             <span id="keepAliveFeedback" class="text-[11px] text-gray-500 mt-1 block">
               Auto-detected if RENDER_EXTERNAL_URL is available. Free ping endpoint: <code class="text-pink-400">/health</code>
             </span>
+          </div>
+        </div>
+
+        <!-- Database Backup & Restore (Survives Cloud Redeploys) -->
+        <div class="p-4 rounded-xl bg-gray-900 border border-gray-800 space-y-3">
+          <div class="flex items-center space-x-2">
+            <i class="fa-solid fa-database text-emerald-400 text-lg"></i>
+            <span class="font-bold text-sm text-white">Database Backup & Restore (Cloud Redeploy Safety)</span>
+          </div>
+          <p class="text-xs text-gray-400">
+            Free cloud hosts (Render / Railway) wipe local disk on redeploys. Export your tracked targets & settings to JSON or restore a previous backup anytime (also available in Telegram via <code>/backupdb</code>).
+          </p>
+          <div class="flex flex-wrap items-center gap-2 pt-1">
+            <a
+              href="/api/backup/export"
+              download
+              id="exportBackupBtn"
+              class="px-3.5 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-bold transition flex items-center space-x-1.5"
+            >
+              <i class="fa-solid fa-file-export"></i>
+              <span>Export Backup (.json)</span>
+            </a>
+            <button
+              type="button"
+              id="importBackupBtn"
+              class="px-3.5 py-2 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/30 text-xs font-bold transition flex items-center space-x-1.5"
+            >
+              <i class="fa-solid fa-file-import"></i>
+              <span>Restore Backup (.json)</span>
+            </button>
+            <input type="file" id="importBackupFileInput" accept=".json,application/json" class="hidden" />
           </div>
         </div>
 
@@ -827,6 +863,6 @@
     </div>
   </footer>
 
-  <script src="/app.js?v=3.8"></script>
+  <script src="/app.js?v=4.0"></script>
 </body>
 </html>

@@ -379,6 +379,102 @@ class Database {
   getDownloadedMediaCount(username) {
     return this.getDownloadedMedia(username).length;
   }
+
+  // --- Backup Export & Restore ---
+  exportSnapshot({ includeSecrets = false } = {}) {
+    const settingsCopy = { ...this.data.settings };
+    if (!includeSecrets) {
+      delete settingsCopy.telegramToken;
+      delete settingsCopy.sessionCookie;
+    }
+
+    return {
+      version: 1,
+      service: 'instagram-privacy-monitor',
+      exportedAt: new Date().toISOString(),
+      settings: settingsCopy,
+      targets: this.data.targets.map(t => ({
+        username: t.username,
+        intervalSec: t.intervalSec,
+        isMonitoring: t.isMonitoring,
+        status: t.status,
+        lastKnownPrivacyState: t.lastKnownPrivacyState || null,
+        profileInfo: t.profileInfo || {}
+      }))
+    };
+  }
+
+  importSnapshot(snapshot, { merge = true } = {}) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      throw new Error('Invalid backup payload: expected JSON object');
+    }
+
+    let addedTargets = 0;
+    let skippedTargets = 0;
+    let updatedSettings = 0;
+
+    // 1. Restore safe settings (ignore empty or masked placeholder secrets)
+    if (snapshot.settings && typeof snapshot.settings === 'object') {
+      const allowed = [
+        'telegramToken',
+        'telegramChatId',
+        'discordWebhookUrl',
+        'defaultIntervalSec',
+        'proxyUrl',
+        'sessionCookie',
+        'appUrl',
+        'soundAlertEnabled',
+        'autoDownloadOnPublic'
+      ];
+      const nextSettings = {};
+      for (const key of allowed) {
+        const val = snapshot.settings[key];
+        if (val === undefined || val === null || val === '') continue;
+        if (key === 'sessionCookie' && typeof val === 'string' && val.includes('...***')) continue;
+        if (key === 'telegramToken' && typeof val === 'string' && val.includes('...')) continue;
+        nextSettings[key] = val;
+        updatedSettings++;
+      }
+      if (updatedSettings > 0) {
+        this.data.settings = { ...this.data.settings, ...nextSettings };
+      }
+    }
+
+    // 2. Restore targets
+    if (!merge) {
+      this.data.targets = [];
+    }
+
+    if (Array.isArray(snapshot.targets)) {
+      for (const rawTarget of snapshot.targets) {
+        try {
+          const clean = validateUsername(rawTarget?.username);
+          if (this.getTarget(clean)) {
+            skippedTargets++;
+            continue;
+          }
+          const created = this.addTarget(clean, rawTarget.intervalSec);
+          if (rawTarget.isMonitoring === false) {
+            created.isMonitoring = false;
+          }
+          if (rawTarget.lastKnownPrivacyState === 'public' || rawTarget.lastKnownPrivacyState === 'private') {
+            created.lastKnownPrivacyState = rawTarget.lastKnownPrivacyState;
+            created.status = rawTarget.lastKnownPrivacyState;
+          }
+          if (rawTarget.profileInfo && typeof rawTarget.profileInfo === 'object') {
+            created.profileInfo = { ...created.profileInfo, ...rawTarget.profileInfo };
+          }
+          addedTargets++;
+        } catch (e) {
+          skippedTargets++;
+        }
+      }
+    }
+
+    this.flushSync();
+    this.addLog(`Restored backup: ${addedTargets} target(s) imported, ${skippedTargets} skipped`, 'success');
+    return { addedTargets, skippedTargets, updatedSettings };
+  }
 }
 
 const dbInstance = new Database();

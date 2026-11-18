@@ -69,7 +69,34 @@ async function httpFetch(url, options = {}, { proxyUrl = null, useKeepAlive = fa
   };
 }
 
+function isAllowedMediaProxyUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    // Strict allowlist of Instagram CDN & supported anonymous public mirrors (SSRF protection)
+    const allowedSuffixes = [
+      '.cdninstagram.com',
+      '.fbcdn.net',
+      '.instagram.com',
+      '.greatfon.com',
+      '.dumpor.io'
+    ];
+    const allowedExact = new Set([
+      'cdninstagram.com',
+      'instagram.com',
+      'greatfon.com',
+      'dumpor.io'
+    ]);
+    return allowedExact.has(host) || allowedSuffixes.some(s => host.endsWith(s));
+  } catch (e) {
+    return false;
+  }
+}
+
 module.exports = {
   httpFetch,
-  getProxyAgent
+  getProxyAgent,
+  isAllowedMediaProxyUrl
 };

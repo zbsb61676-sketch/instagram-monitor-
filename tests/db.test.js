@@ -65,4 +65,29 @@ describe('Database & Backup Recovery', () => {
     assert.equal(recoveredDb.recoveredFromBackup, true);
     assert.ok(recoveredDb.getTarget('persisted_user'), 'Target should be recovered from .bak');
   });
+
+  it('exports redacted snapshots and restores targets without duplicates', () => {
+    const { db } = createTempDb();
+    db.updateSettings({
+      telegramToken: '12345:SECRET',
+      sessionCookie: 'sessionid=secret_cookie',
+      telegramChatId: '987654'
+    });
+    db.addTarget('alpha_user', 5);
+    db.addTarget('beta_user', 10);
+
+    const snapshot = db.exportSnapshot({ includeSecrets: false });
+    assert.equal(snapshot.targets.length, 2);
+    assert.equal(snapshot.settings.telegramToken, undefined);
+    assert.equal(snapshot.settings.sessionCookie, undefined);
+    assert.equal(snapshot.settings.telegramChatId, '987654');
+
+    const { db: freshDb } = createTempDb();
+    freshDb.addTarget('alpha_user', 3); // already exists
+    const res = freshDb.importSnapshot(snapshot, { merge: true });
+    assert.equal(res.addedTargets, 1);
+    assert.equal(res.skippedTargets, 1);
+    assert.equal(freshDb.getTargets().length, 2);
+    assert.equal(freshDb.getSettings().telegramChatId, '987654');
+  });
 });
