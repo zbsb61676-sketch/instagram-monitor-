@@ -28,42 +28,84 @@ const defaultState = {
   downloadedMedia: {}
 };
 
+const USERNAME_REGEX = /^[a-z0-9](?:[a-z0-9._]{0,28}[a-z0-9])?$|^[a-z0-9]$/;
+
+function sanitizeUsername(username) {
+  return String(username || '').toLowerCase().trim().replace(/^@/, '');
+}
+
+function validateUsername(username) {
+  const clean = sanitizeUsername(username);
+  if (!clean) throw new Error('Username cannot be empty');
+  if (clean.length > 30) throw new Error('Instagram usernames must be 30 characters or fewer');
+  if (!/^[a-z0-9._]+$/.test(clean) || clean.includes('..')) {
+    throw new Error('Invalid Instagram username format');
+  }
+  return clean;
+}
+
 class Database {
-  constructor() {
-    this.filePath = config.DB_FILE;
+  constructor(filePath = config.DB_FILE) {
+    this.filePath = filePath;
+    this.backupPath = `${filePath}.bak`;
     this.saveTimer = null;
     this.isDirty = false;
+    this.recoveredFromBackup = false;
     this.data = this.load();
   }
 
-  load() {
-    try {
-      if (fs.existsSync(this.filePath)) {
-        const raw = fs.readFileSync(this.filePath, 'utf-8');
-        const parsed = JSON.parse(raw);
-        
-        // Merge loaded settings with default/environment settings
-        const mergedSettings = { ...defaultState.settings };
-        if (parsed.settings && typeof parsed.settings === 'object') {
-          for (const [key, val] of Object.entries(parsed.settings)) {
-            if (val !== undefined && val !== null && val !== '') {
-              mergedSettings[key] = val;
-            }
-          }
-        }
-
-        return {
-          settings: mergedSettings,
-          targets: Array.isArray(parsed.targets) ? parsed.targets : [],
-          logs: Array.isArray(parsed.logs) ? parsed.logs : [],
-          downloadedMedia: parsed.downloadedMedia && typeof parsed.downloadedMedia === 'object' ? parsed.downloadedMedia : {}
-        };
-      }
-    } catch (err) {
-      console.error('[DB] Failed to parse db.json, initializing fresh defaults:', err.message);
+  _parseState(raw) {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Database root must be a JSON object');
     }
-    this.flushSync(defaultState);
-    return JSON.parse(JSON.stringify(defaultState));
+
+    // Merge loaded settings with default/environment settings
+    const mergedSettings = { ...defaultState.settings };
+    if (parsed.settings && typeof parsed.settings === 'object') {
+      for (const [key, val] of Object.entries(parsed.settings)) {
+        if (val !== undefined && val !== null && val !== '') {
+          mergedSettings[key] = val;
+        }
+      }
+    }
+
+    return {
+      settings: mergedSettings,
+      targets: Array.isArray(parsed.targets) ? parsed.targets : [],
+      logs: Array.isArray(parsed.logs) ? parsed.logs : [],
+      downloadedMedia: parsed.downloadedMedia && typeof parsed.downloadedMedia === 'object' ? parsed.downloadedMedia : {}
+    };
+  }
+
+  load() {
+    // 1. Try primary database file
+    if (fs.existsSync(this.filePath)) {
+      try {
+        const raw = fs.readFileSync(this.filePath, 'utf-8');
+        return this._parseState(raw);
+      } catch (err) {
+        console.error('[DB] Primary db.json is corrupted:', err.message);
+      }
+    }
+
+    // 2. Fallback to rolling backup file if primary is missing or corrupted
+    if (fs.existsSync(this.backupPath)) {
+      try {
+        const backupRaw = fs.readFileSync(this.backupPath, 'utf-8');
+        const recovered = this._parseState(backupRaw);
+        this.recoveredFromBackup = true;
+        console.warn('[DB] Recovered state automatically from rolling backup (db.json.bak).');
+        this.flushSync(recovered);
+        return recovered;
+      } catch (bakErr) {
+        console.error('[DB] Backup db.json.bak also unreadable, initializing fresh defaults:', bakErr.message);
+      }
+    }
+
+    const fresh = JSON.parse(JSON.stringify(defaultState));
+    this.flushSync(fresh);
+    return fresh;
   }
 
   /**
@@ -88,11 +130,14 @@ class Database {
           this.flushSync();
         }
       }, 500);
+      if (typeof this.saveTimer.unref === 'function') {
+        this.saveTimer.unref();
+      }
     }
   }
 
   /**
-   * Atomic synchronous flush to disk
+   * Atomic synchronous flush to disk with rolling backup preservation
    */
   flushSync(dataToSave = null) {
     if (this.saveTimer) {
@@ -100,9 +145,26 @@ class Database {
       this.saveTimer = null;
     }
     try {
+      const dir = path.dirname(this.filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
       const data = dataToSave || this.data;
-      const tempPath = `${this.filePath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
+      const serialized = JSON.stringify(data, null, 2);
+
+      // Preserve last-known-good file as .bak before replacing
+      if (fs.existsSync(this.filePath)) {
+        try {
+          const existing = fs.readFileSync(this.filePath, 'utf-8');
+          JSON.parse(existing); // Only back up if current file is valid JSON
+          fs.copyFileSync(this.filePath, this.backupPath);
+        } catch (e) {
+          // Do not overwrite a good backup with a corrupted primary file
+        }
+      }
+
+      const tempPath = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+      fs.writeFileSync(tempPath, serialized, 'utf-8');
       fs.renameSync(tempPath, this.filePath);
       this.isDirty = false;
     } catch (err) {
@@ -134,8 +196,7 @@ class Database {
   }
 
   addTarget(username, intervalSec = null) {
-    const cleanUsername = (username || '').toLowerCase().trim().replace(/^@/, '');
-    if (!cleanUsername) throw new Error('Username cannot be empty');
+    const cleanUsername = validateUsername(username);
 
     const existing = this.getTarget(cleanUsername);
     if (existing) {
@@ -156,8 +217,12 @@ class Database {
       previousStatus: null,
       isMonitoring: true,
       lastCheckedAt: null,
+      lastSuccessAt: null,
       lastChangedAt: null,
       consecutiveErrors: 0,
+      totalChecks: 0,
+      successfulChecks: 0,
+      avgLatencyMs: null,
       profileInfo: {
         fullName: '',
         isVerified: false,
@@ -316,4 +381,7 @@ class Database {
   }
 }
 
-module.exports = new Database();
+const dbInstance = new Database();
+dbInstance.Database = Database;
+dbInstance.validateUsername = validateUsername;
+module.exports = dbInstance;

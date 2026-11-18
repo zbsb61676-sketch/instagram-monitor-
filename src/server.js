@@ -4,6 +4,7 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const archiver = require('archiver');
 const { WebSocketServer } = require('ws');
 const config = require('./config');
@@ -13,15 +14,103 @@ const { testTelegram, testDiscord, dispatchTransitionAlert } = require('./notifi
 const { downloadTargetContent } = require('./downloader');
 const proxyManager = require('./proxyManager');
 const cacheManager = require('./cacheManager');
+const storageManager = require('./storageManager');
 const telegramBot = require('./telegramBot');
 const keepAlive = require('./keepAlive');
 
 const app = express();
+app.disable('x-powered-by');
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// Constant-time secret check using SHA-256 digests
+function secretsEqual(provided, expected) {
+  if (!provided || !expected) return false;
+  const h1 = crypto.createHash('sha256').update(String(provided)).digest();
+  const h2 = crypto.createHash('sha256').update(String(expected)).digest();
+  return crypto.timingSafeEqual(h1, h2);
+}
+
+function isAuthorizedRequest(req) {
+  const expected = config.DASHBOARD_PASSWORD;
+  if (!expected) return true;
+
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey && secretsEqual(apiKey, expected)) return true;
+
+  const authHeader = req.headers['authorization'] || '';
+  if (authHeader.startsWith('Bearer ')) {
+    if (secretsEqual(authHeader.slice(7).trim(), expected)) return true;
+  } else if (authHeader.startsWith('Basic ')) {
+    try {
+      const decoded = Buffer.from(authHeader.slice(6).trim(), 'base64').toString('utf-8');
+      const sepIdx = decoded.indexOf(':');
+      const pass = sepIdx >= 0 ? decoded.slice(sepIdx + 1) : decoded;
+      if (secretsEqual(pass, expected)) return true;
+    } catch (e) {}
+  }
+
+  return false;
+}
+
+// Lightweight in-memory sliding-window rate limiter for heavy endpoints
+function createRateLimiter({ windowMs = 60000, max = 15 } = {}) {
+  const hits = new Map();
+  const cleanup = setInterval(() => {
+    const cutoff = Date.now() - windowMs;
+    for (const [ip, timestamps] of hits.entries()) {
+      const fresh = timestamps.filter(ts => ts > cutoff);
+      if (fresh.length === 0) hits.delete(ip);
+      else hits.set(ip, fresh);
+    }
+  }, windowMs);
+  if (typeof cleanup.unref === 'function') cleanup.unref();
+
+  return (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    const list = (hits.get(ip) || []).filter(ts => ts > cutoff);
+    if (list.length >= max) {
+      const retryAfterSec = Math.max(1, Math.ceil((list[0] + windowMs - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        error: `Too many requests. Please retry in ${retryAfterSec}s.`
+      });
+    }
+    list.push(now);
+    hits.set(ip, list);
+    next();
+  };
+}
+
+const heavyEndpointLimiter = createRateLimiter({ windowMs: 60000, max: 20 });
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  next();
+});
+
+// Optional Dashboard & API authentication (leaves /health, /ping, /api/ping open for cloud probes)
+app.use((req, res, next) => {
+  if (!config.DASHBOARD_PASSWORD) return next();
+  if (req.path === '/health' || req.path === '/ping' || req.path === '/api/ping') {
+    return next();
+  }
+  if (isAuthorizedRequest(req)) return next();
+
+  res.setHeader('WWW-Authenticate', 'Basic realm="IG Radar Dashboard"');
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  return res.status(401).send('Authentication required');
+});
+
 // Middleware
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/downloads', express.static(config.DOWNLOADS_DIR));
 app.use('/cache', express.static(config.CACHE_DIR));
@@ -131,7 +220,12 @@ db.addLog = function(message, level = 'info', username = null) {
 };
 
 // --- WebSocket Connection with 30s Zombie Cleanup Heartbeat ---
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  if (!isAuthorizedRequest(req)) {
+    ws.close(1008, 'Authentication required');
+    return;
+  }
+
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
@@ -190,10 +284,17 @@ const wsHeartbeatInterval = setInterval(() => {
 // Health & Ping Endpoints (Render.com 24/7 Anti-Sleep Keep-Alive)
 app.get(['/health', '/ping', '/api/ping'], (req, res) => {
   const keepAliveStatus = keepAlive.getStatus();
+  const mem = process.memoryUsage();
   res.json({
     status: 'ok',
     service: 'instagram-privacy-monitor',
     uptime: process.uptime(),
+    memoryMB: {
+      rss: Math.round(mem.rss / (1024 * 1024)),
+      heapUsed: Math.round(mem.heapUsed / (1024 * 1024))
+    },
+    monitor: monitor.getDiagnostics(),
+    storage: storageManager.getStats(),
     keepAlive: {
       active: keepAliveStatus.active,
       pingCount: keepAliveStatus.pingCount,
@@ -219,8 +320,12 @@ app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
     uptime: process.uptime(),
+    authEnabled: Boolean(config.DASHBOARD_PASSWORD),
     targetsCount: targets.length,
     activeMonitoringCount: activeCount,
+    monitor: monitor.getDiagnostics(),
+    proxies: proxyManager.getStats(),
+    storage: storageManager.getStats(),
     serverTime: new Date().toISOString()
   });
 });
@@ -410,7 +515,7 @@ app.delete('/api/targets/:id', (req, res) => {
 });
 
 // Download Content Endpoints
-app.post('/api/targets/:id/download', async (req, res) => {
+app.post('/api/targets/:id/download', heavyEndpointLimiter, async (req, res) => {
   const target = db.getTarget(req.params.id);
   if (!target) {
     return res.status(404).json({ error: 'Target not found' });
@@ -459,7 +564,7 @@ app.get('/api/targets/:id/downloads', (req, res) => {
 });
 
 // Ephemeral Cache: Inspect & Cache Profile Media (Real-Time Live Download)
-app.post(['/api/cache/inspect', '/api/download-live'], async (req, res) => {
+app.post(['/api/cache/inspect', '/api/download-live'], heavyEndpointLimiter, async (req, res) => {
   const { username } = req.body;
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
@@ -680,7 +785,7 @@ function sendTargetZip(clean, res) {
 }
 
 // In-App Anonymous Backup Viewer Proxy (Allows AnonyIG to run directly inside our dashboard)
-app.get('/api/backup-viewer/:username', async (req, res) => {
+app.get('/api/backup-viewer/:username', heavyEndpointLimiter, async (req, res) => {
   const clean = cleanHandle(req.params.username);
   if (!clean) return res.status(400).send('Invalid username');
 
@@ -771,7 +876,7 @@ app.put('/api/settings', (req, res) => {
 });
 
 // Test Notification Endpoints
-app.post('/api/settings/test-telegram', async (req, res) => {
+app.post('/api/settings/test-telegram', heavyEndpointLimiter, async (req, res) => {
   const currentSettings = db.getSettings();
   const incomingToken = typeof req.body.token === 'string' ? req.body.token.trim() : '';
   const token = (incomingToken && !incomingToken.includes('...')) ? incomingToken : currentSettings.telegramToken;
@@ -787,7 +892,7 @@ app.post('/api/settings/test-telegram', async (req, res) => {
   }
 });
 
-app.post('/api/settings/test-discord', async (req, res) => {
+app.post('/api/settings/test-discord', heavyEndpointLimiter, async (req, res) => {
   const currentSettings = db.getSettings();
   const webhookUrl = req.body.webhookUrl || currentSettings.discordWebhookUrl;
 
@@ -813,9 +918,22 @@ app.delete('/api/logs', (req, res) => {
   res.json({ success: true });
 });
 
-// Fallback to index.html for SPA routing
+// Fallback to index.html for SPA routing (keep 404 JSON for unknown /api/* routes)
 app.use((req, res) => {
+  if (req.path.startsWith('/api/')) {
+    return res.status(404).json({ error: 'API endpoint not found' });
+  }
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
+// Global Express Error Handler (prevents raw stack traces & handles malformed JSON cleanly)
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON request body' });
+  }
+  console.error('[Server] Unhandled route error:', err?.message || err);
+  if (res.headersSent) return next(err);
+  res.status(err?.status || 500).json({ error: 'Internal server error' });
 });
 
 // Start Server
@@ -823,24 +941,52 @@ server.listen(config.PORT, config.HOST, () => {
   console.log(`====================================================`);
   console.log(`🚀 Instagram Privacy Status Monitor is Running!`);
   console.log(`🌐 Local Web Dashboard: http://localhost:${config.PORT}`);
+  if (config.DASHBOARD_PASSWORD) {
+    console.log(`🔒 Dashboard Authentication: ENABLED`);
+  }
   console.log(`====================================================`);
   monitor.start();
+  storageManager.start();
   telegramBot.setBroadcastFunction(broadcast);
   telegramBot.setMonitorService(monitor);
   telegramBot.start();
   keepAlive.start();
 });
 
+// Process-level resilience guards
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] Unhandled Promise Rejection:', reason instanceof Error ? reason.message : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught Exception:', err.message);
+  try {
+    db.flushSync();
+  } catch (e) {}
+});
+
 // Graceful shutdown on SIGINT & SIGTERM (Render / Railway / Docker / Kubernetes)
+let isShuttingDown = false;
 const handleShutdown = (signal) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log(`\n[Server] Received ${signal}. Shutting down gracefully...`);
   if (typeof wsHeartbeatInterval !== 'undefined') {
     clearInterval(wsHeartbeatInterval);
   }
   keepAlive.stop();
+  storageManager.stop();
   monitor.stop();
   telegramBot.stop();
   db.flushSync(); // Ensure all debounced database changes are written to disk
+
+  // Force exit if keep-alive sockets hang longer than 8s
+  const forceTimer = setTimeout(() => {
+    console.warn('[Server] Shutdown timeout reached; forcing exit.');
+    process.exit(0);
+  }, 8000);
+  if (typeof forceTimer.unref === 'function') forceTimer.unref();
+
   server.close(() => {
     console.log('[Server] HTTP and WebSocket servers closed. Exiting.');
     process.exit(0);

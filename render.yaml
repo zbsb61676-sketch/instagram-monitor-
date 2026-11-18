@@ -23,3 +23,7 @@ services:
         sync: false
       - key: APP_URL
         sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: MAX_STORAGE_MB
+        value: 500

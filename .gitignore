@@ -7,6 +7,7 @@ node_modules/
 
 # Database runtime files (prevent leaking tokens / private cookies to public repos)
 data/db.json
+data/*.bak
 data/*.tmp
 
 # Media storage & downloads

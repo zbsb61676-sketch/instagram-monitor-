@@ -5,7 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node --dns-result-order=ipv4first src/server.js",
-    "dev": "node --dns-result-order=ipv4first --watch src/server.js"
+    "dev": "node --dns-result-order=ipv4first --watch src/server.js",
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "instagram",

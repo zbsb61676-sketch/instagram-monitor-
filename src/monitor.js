@@ -3,17 +3,99 @@
  * Continuously monitors targets at their specified intervals (e.g. every second).
  */
 
+const config = require('./config');
 const db = require('./db');
 const { checkInstagramProfile } = require('./igChecker');
 const { dispatchTransitionAlert, dispatchMediaDownloadedAlert, dispatchActivityAlert } = require('./notifier');
 const { downloadTargetContent } = require('./downloader');
 
 class MonitorService {
-  constructor() {
+  constructor(deps = {}) {
+    this.db = deps.db || db;
+    this.checkFn = deps.checkFn || checkInstagramProfile;
+    this.dispatchTransitionAlertFn = deps.dispatchTransitionAlert || dispatchTransitionAlert;
+    this.dispatchMediaDownloadedAlertFn = deps.dispatchMediaDownloadedAlert || dispatchMediaDownloadedAlert;
+    this.dispatchActivityAlertFn = deps.dispatchActivityAlert || dispatchActivityAlert;
+    this.downloadTargetContentFn = deps.downloadTargetContent || downloadTargetContent;
+
     this.timers = new Map(); // targetId -> NodeJS.Timeout
     this.activeLocks = new Set(); // targetId being actively queried
     this.broadcastFn = null;
     this.isRunning = false;
+
+    // Global concurrency semaphore
+    this.maxConcurrentChecks = deps.maxConcurrentChecks || config.MAX_CONCURRENT_CHECKS || 3;
+    this.activeCheckSlots = 0;
+    this.waitQueue = [];
+
+    // Global rate-limit circuit breaker
+    this.circuitThreshold = deps.circuitThreshold || config.CIRCUIT_BREAKER_THRESHOLD || 5;
+    this.circuitCooldownMs = deps.circuitCooldownMs || config.CIRCUIT_BREAKER_COOLDOWN_MS || 60000;
+    this.consecutiveGlobalRateLimits = 0;
+    this.circuitOpenUntil = 0;
+    this.circuitTrips = 0;
+  }
+
+  acquireSlot() {
+    if (this.activeCheckSlots < this.maxConcurrentChecks) {
+      this.activeCheckSlots++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waitQueue.push(resolve);
+    });
+  }
+
+  releaseSlot() {
+    if (this.waitQueue.length > 0) {
+      const next = this.waitQueue.shift();
+      next();
+    } else {
+      this.activeCheckSlots = Math.max(0, this.activeCheckSlots - 1);
+    }
+  }
+
+  isCircuitOpen() {
+    return Date.now() < this.circuitOpenUntil;
+  }
+
+  recordGlobalRateLimit() {
+    this.consecutiveGlobalRateLimits++;
+    if (this.consecutiveGlobalRateLimits >= this.circuitThreshold && !this.isCircuitOpen()) {
+      this.circuitOpenUntil = Date.now() + this.circuitCooldownMs;
+      this.circuitTrips++;
+      const cooldownSec = Math.round(this.circuitCooldownMs / 1000);
+      console.warn(`[Monitor] Circuit breaker OPEN after ${this.consecutiveGlobalRateLimits} consecutive rate limits. Cooling down for ${cooldownSec}s.`);
+      this.db.addLog(
+        `Circuit breaker triggered after ${this.consecutiveGlobalRateLimits} consecutive rate limits. Pausing background checks for ${cooldownSec}s to protect IP.`,
+        'warning'
+      );
+    }
+  }
+
+  resetCircuitBreaker() {
+    if (this.consecutiveGlobalRateLimits > 0 || this.circuitOpenUntil > 0) {
+      this.consecutiveGlobalRateLimits = 0;
+      this.circuitOpenUntil = 0;
+    }
+  }
+
+  getDiagnostics() {
+    const now = Date.now();
+    return {
+      isRunning: this.isRunning,
+      activeChecks: this.activeCheckSlots,
+      queuedChecks: this.waitQueue.length,
+      maxConcurrentChecks: this.maxConcurrentChecks,
+      scheduledTargets: this.timers.size,
+      circuitBreaker: {
+        state: now < this.circuitOpenUntil ? 'OPEN' : 'CLOSED',
+        consecutiveRateLimits: this.consecutiveGlobalRateLimits,
+        threshold: this.circuitThreshold,
+        remainingCooldownSec: now < this.circuitOpenUntil ? Math.ceil((this.circuitOpenUntil - now) / 1000) : 0,
+        totalTrips: this.circuitTrips
+      }
+    };
   }
 
   setBroadcastFunction(fn) {
@@ -35,7 +117,7 @@ class MonitorService {
     this.isRunning = true;
     console.log('[Monitor] Starting background monitoring engine...');
 
-    const targets = db.getTargets();
+    const targets = this.db.getTargets();
     for (const target of targets) {
       if (target.isMonitoring) {
         this.scheduleTarget(target);
@@ -66,6 +148,9 @@ class MonitorService {
     const timer = setTimeout(async () => {
       await this.executeCheck(target.id);
     }, delayMs);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
 
     this.timers.set(target.id, timer);
   }
@@ -73,35 +158,62 @@ class MonitorService {
   async executeCheck(targetId, options = {}) {
     if (!this.isRunning && !options.force) return;
 
+    // Respect circuit breaker for routine background checks (manual force checks bypass it)
+    if (!options.force && this.isCircuitOpen()) {
+      const latestTarget = this.db.getTarget(targetId);
+      if (latestTarget && latestTarget.isMonitoring && this.isRunning) {
+        const remainingMs = Math.max(1000, this.circuitOpenUntil - Date.now());
+        this.scheduleTarget(latestTarget, remainingMs + Math.floor(Math.random() * 1000));
+      }
+      return;
+    }
+
     // Concurrency lock per target
     if (this.activeLocks.has(targetId) && !options.force) return;
     this.activeLocks.add(targetId);
 
-    const target = db.getTarget(targetId);
+    const target = this.db.getTarget(targetId);
     if (!target || (!target.isMonitoring && !options.force)) {
       this.activeLocks.delete(targetId);
       return;
     }
 
-    const settings = db.getSettings();
+    const settings = this.db.getSettings();
+    let slotAcquired = false;
 
     try {
+      await this.acquireSlot();
+      slotAcquired = true;
+
+      const t0 = Date.now();
       // Routine monitoring checks are ALWAYS 100% anonymous to guarantee
       // the user's account is NEVER challenged, flagged, or suspended.
-      const result = await checkInstagramProfile(target.username, {
+      const result = await this.checkFn(target.username, {
         proxyUrl: settings.proxyUrl
       });
+      const latencyMs = typeof result.latencyMs === 'number' ? result.latencyMs : (Date.now() - t0);
 
       const now = new Date().toISOString();
       const previousStatus = target.status;
       const newStatus = result.status;
 
       let consecutiveErrors = target.consecutiveErrors || 0;
+      const totalChecks = (target.totalChecks || 0) + 1;
+      let successfulChecks = target.successfulChecks || 0;
+
       if (newStatus === 'error' || newStatus === 'rate_limited') {
         consecutiveErrors++;
+        if (newStatus === 'rate_limited') {
+          this.recordGlobalRateLimit();
+        }
       } else {
         consecutiveErrors = 0;
+        successfulChecks++;
+        this.resetCircuitBreaker();
       }
+
+      const prevAvg = typeof target.avgLatencyMs === 'number' ? target.avgLatencyMs : latencyMs;
+      const avgLatencyMs = Math.round((prevAvg * 0.7) + (latencyMs * 0.3));
 
       // Target privacy status preserves last known PUBLIC/PRIVATE state across transient errors/rate limits.
       let effectiveStatus = target.status;
@@ -115,9 +227,16 @@ class MonitorService {
       const updates = {
         lastCheckedAt: now,
         consecutiveErrors,
+        totalChecks,
+        successfulChecks,
+        avgLatencyMs,
         status: effectiveStatus,
         connectionStatus: (newStatus === 'rate_limited') ? 'rate_limited' : (newStatus === 'error' ? 'error' : 'healthy')
       };
+
+      if (newStatus !== 'error' && newStatus !== 'rate_limited') {
+        updates.lastSuccessAt = now;
+      }
 
       if (result.error) {
         updates.lastError = result.error;
@@ -149,7 +268,7 @@ class MonitorService {
           updates.previousStatus = priorPrivacyState;
           updates.lastChangedAt = now;
 
-          db.addLog(
+          this.db.addLog(
             `Status changed for @${target.username}: ${priorPrivacyState.toUpperCase()} ➔ ${newStatus.toUpperCase()}`,
             newStatus === 'public' ? 'alert' : 'warning',
             target.username
@@ -161,18 +280,18 @@ class MonitorService {
           // TRANSITION ALERTS: Triggers for BOTH Private -> Public AND Public -> Private!
           if (isPrivateToPublic || isPublicToPrivate) {
             const updatedTargetObj = { ...target, ...updates };
-            await dispatchTransitionAlert(
+            await this.dispatchTransitionAlertFn(
               updatedTargetObj,
               priorPrivacyState,
               newStatus,
               settings,
-              db,
+              this.db,
               this.broadcast.bind(this)
             );
 
             // AUTO-DOWNLOAD: Trigger automatic download of all available content when transitioning to public
             if (isPrivateToPublic && settings.autoDownloadOnPublic !== false) {
-              downloadTargetContent(target.username, {
+              this.downloadTargetContentFn(target.username, {
                 proxyUrl: settings.proxyUrl,
                 sessionCookie: settings.sessionCookie
               }).then(async dlSummary => {
@@ -186,7 +305,7 @@ class MonitorService {
 
                 // Send downloaded photos directly to Telegram and Discord
                 if (dlSummary.downloadedItems && dlSummary.downloadedItems.length > 0) {
-                  await dispatchMediaDownloadedAlert(target.username, dlSummary.downloadedItems, settings, db);
+                  await this.dispatchMediaDownloadedAlertFn(target.username, dlSummary.downloadedItems, settings, this.db);
                 }
               }).catch(dlErr => {
                 console.error(`[Downloader] Auto-download error for @${target.username}:`, dlErr.message);
@@ -207,9 +326,9 @@ class MonitorService {
         if (result.profileInfo?.latestReelMedia) {
           const currentReel = result.profileInfo.latestReelMedia;
           if (target.lastSeenReelMedia && currentReel > target.lastSeenReelMedia) {
-            await dispatchActivityAlert('NEW_STORY', { username: target.username }, settings, db, this.broadcast.bind(this));
+            await this.dispatchActivityAlertFn('NEW_STORY', { username: target.username }, settings, this.db, this.broadcast.bind(this));
             if (settings.autoDownloadOnPublic !== false) {
-              downloadTargetContent(target.username, {
+              this.downloadTargetContentFn(target.username, {
                 proxyUrl: settings.proxyUrl,
                 sessionCookie: settings.sessionCookie
               }).catch(() => {});
@@ -222,9 +341,9 @@ class MonitorService {
         if (result.profileInfo?.postCodes && result.profileInfo.postCodes.length > 0) {
           const latestCode = result.profileInfo.postCodes[0];
           if (target.lastSeenPostCode && latestCode !== target.lastSeenPostCode) {
-            await dispatchActivityAlert('NEW_POST', { username: target.username, postCode: latestCode }, settings, db, this.broadcast.bind(this));
+            await this.dispatchActivityAlertFn('NEW_POST', { username: target.username, postCode: latestCode }, settings, this.db, this.broadcast.bind(this));
             if (settings.autoDownloadOnPublic !== false) {
-              downloadTargetContent(target.username, {
+              this.downloadTargetContentFn(target.username, {
                 proxyUrl: settings.proxyUrl,
                 sessionCookie: settings.sessionCookie
               }).catch(() => {});
@@ -239,21 +358,21 @@ class MonitorService {
           const oldBio = target.profileInfo?.biography;
           const newBio = result.profileInfo.biography;
           if (oldBio && newBio && oldBio !== newBio) {
-            await dispatchActivityAlert('BIO_CHANGED', { username: target.username, oldBio, newBio }, settings, db, this.broadcast.bind(this));
+            await this.dispatchActivityAlertFn('BIO_CHANGED', { username: target.username, oldBio, newBio }, settings, this.db, this.broadcast.bind(this));
           }
         }
       }
 
       // If rate limited, log warning occasionally
       if (newStatus === 'rate_limited' && consecutiveErrors % 10 === 1) {
-        db.addLog(
+        this.db.addLog(
           `Instagram rate-limit encountered for @${target.username}. Consider adding a proxy in Settings.`,
           'warning',
           target.username
         );
       }
 
-      const updatedTarget = db.updateTarget(target.id, updates);
+      const updatedTarget = this.db.updateTarget(target.id, updates);
 
       // Broadcast update to WebSocket clients
       this.broadcast({
@@ -265,9 +384,10 @@ class MonitorService {
       console.error(`[Monitor] Error checking @${target.username}:`, err.message);
       const fallbackStatus = target.lastKnownPrivacyState ||
         (target.status === 'public' || target.status === 'private' ? target.status : 'pending');
-      const erroredTarget = db.updateTarget(target.id, {
+      const erroredTarget = this.db.updateTarget(target.id, {
         lastCheckedAt: new Date().toISOString(),
         consecutiveErrors: (target.consecutiveErrors || 0) + 1,
+        totalChecks: (target.totalChecks || 0) + 1,
         status: fallbackStatus,
         connectionStatus: 'error',
         lastError: err.message
@@ -279,10 +399,13 @@ class MonitorService {
         });
       }
     } finally {
+      if (slotAcquired) {
+        this.releaseSlot();
+      }
       this.activeLocks.delete(targetId);
 
       // Re-schedule next run based on intervalSec with adaptive rate-limit backoff & jitter
-      const latestTarget = db.getTarget(targetId);
+      const latestTarget = this.db.getTarget(targetId);
       if (latestTarget && latestTarget.isMonitoring && this.isRunning) {
         let intervalMs = Math.max(1000, (latestTarget.intervalSec || 3) * 1000);
 
@@ -296,6 +419,11 @@ class MonitorService {
           intervalMs = Math.max(intervalMs, 10000); // 10s cooldown on persistent network errors
         }
 
+        // Respect circuit breaker cooldown if open
+        if (this.isCircuitOpen()) {
+          intervalMs = Math.max(intervalMs, this.circuitOpenUntil - Date.now());
+        }
+
         // Add small jitter (up to 500ms) to prevent multi-target thundering herd
         const jitter = Math.floor(Math.random() * 500);
         this.scheduleTarget(latestTarget, intervalMs + jitter);
@@ -307,13 +435,13 @@ class MonitorService {
    * Manually trigger check right now for a target
    */
   async checkNow(targetId) {
-    const target = db.getTarget(targetId);
+    const target = this.db.getTarget(targetId);
     if (!target) throw new Error('Target not found');
 
     // Clear active lock to ensure manual user check runs immediately
     this.activeLocks.delete(target.id);
     await this.executeCheck(target.id, { force: true });
-    return db.getEnrichedTarget(target.id);
+    return this.db.getEnrichedTarget(target.id);
   }
 
   /**
@@ -347,4 +475,6 @@ class MonitorService {
   }
 }
 
-module.exports = new MonitorService();
+const monitorInstance = new MonitorService();
+monitorInstance.MonitorService = MonitorService;
+module.exports = monitorInstance;

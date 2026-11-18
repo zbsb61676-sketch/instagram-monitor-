@@ -39,16 +39,78 @@ function decodeHtmlEntities(str) {
     .replace(/&gt;/g, '>');
 }
 
+function isBotChallengePage(html) {
+  if (!html || typeof html !== 'string') return true;
+  return (
+    /Just a moment\.\.\./i.test(html) ||
+    /Attention Required!\s*\|\s*Cloudflare/i.test(html) ||
+    /cf-browser-verification/i.test(html) ||
+    /challenge-platform/i.test(html) ||
+    /Checking your browser before accessing/i.test(html) ||
+    /Enable JavaScript and cookies to continue/i.test(html) ||
+    /DDoS-Guard/i.test(html) ||
+    /Access denied\s*\|\s*.*used Cloudflare/i.test(html)
+  );
+}
+
+/**
+ * Parse anonymous mirror HTML safely, rejecting bot walls and generic landing pages.
+ */
+function parseMirrorHtml(html, cleanUsername, providerName = 'mirror') {
+  const clean = (cleanUsername || '').trim().toLowerCase().replace(/^@/, '');
+  if (!clean || !html || html.length < 500) return null;
+  if (isBotChallengePage(html)) return null;
+
+  const isNotFound = /User not found|Page not found|Account not found|404 Not Found/i.test(html);
+  if (isNotFound) {
+    return {
+      status: 'not_found',
+      profileInfo: null,
+      fallbackMirror: providerName,
+      error: 'Account not found (via mirror fallback)'
+    };
+  }
+
+  // Ensure the mirror page actually rendered the requested profile (not a generic landing/error page)
+  if (!html.toLowerCase().includes(clean)) {
+    return null;
+  }
+
+  const isPrivate = /This account is private|Private Account|Follow to see their photos and videos/i.test(html);
+
+  const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
+  let fullName = '';
+  if (titleMatch) {
+    const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
+    const escapedClean = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    fullName = parts.replace(new RegExp(`^${escapedClean}\\s*`, 'i'), '').trim();
+  }
+
+  return {
+    status: isPrivate ? 'private' : 'public',
+    profileInfo: {
+      fullName: fullName || clean,
+      isVerified: false,
+      biography: '',
+      profilePicUrl: '',
+      postsCount: 0
+    },
+    fallbackMirror: providerName,
+    error: null
+  };
+}
+
 /**
  * Checks an Instagram handle's privacy status.
  * @param {string} username - Target handle (without @)
  * @param {object} options - { proxyUrl, sessionCookie }
- * @returns {Promise<{ status: 'public'|'private'|'not_found'|'rate_limited'|'error', profileInfo: object, error?: string }>}
+ * @returns {Promise<{ status: 'public'|'private'|'not_found'|'rate_limited'|'error', profileInfo: object, latencyMs?: number, error?: string }>}
  */
 async function checkInstagramProfile(username, options = {}) {
+  const t0 = Date.now();
   const clean = (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
   if (!clean) {
-    return { status: 'error', profileInfo: null, error: 'Invalid username format' };
+    return { status: 'error', profileInfo: null, latencyMs: 0, error: 'Invalid username format' };
   }
   const url = `https://www.instagram.com/${clean}/`;
 
@@ -186,6 +248,7 @@ async function checkInstagramProfile(username, options = {}) {
     return {
       status: isPrivate ? 'private' : 'public',
       profileInfo,
+      latencyMs: Date.now() - t0,
       error: null
     };
   } catch (err) {
@@ -193,12 +256,13 @@ async function checkInstagramProfile(username, options = {}) {
     // Attempt anonymous mirror fallback on network timeout or fetch error
     const mirrorResult = await checkViaMirror(clean);
     if (mirrorResult) {
-      return mirrorResult;
+      return { ...mirrorResult, latencyMs: Date.now() - t0 };
     }
 
     return {
       status: 'error',
       profileInfo: null,
+      latencyMs: Date.now() - t0,
       error: err.message
     };
   }
@@ -232,40 +296,11 @@ async function checkViaMirror(username) {
       if (!res.ok) continue;
 
       const html = await res.text();
-      if (!html || html.length < 500) continue;
-
-      const isNotFound = /User not found|Page not found|Account not found|404 Not Found/i.test(html);
-      if (isNotFound) {
-        return {
-          status: 'not_found',
-          profileInfo: null,
-          error: 'Account not found (via mirror fallback)'
-        };
+      const providerName = url.includes('greatfon') ? 'greatfon' : 'dumpor';
+      const parsed = parseMirrorHtml(html, clean, providerName);
+      if (parsed) {
+        return parsed;
       }
-
-      const isPrivate = /This account is private|Private Account|Follow to see their photos and videos/i.test(html);
-
-      // Extract basic profile metadata from mirror if possible
-      const titleMatch = html.match(/<title>([^<]*)<\/title>/i);
-      let fullName = '';
-      if (titleMatch) {
-        const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
-        const escapedClean = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        fullName = parts.replace(new RegExp(`^${escapedClean}\\s*`, 'i'), '').trim();
-      }
-
-      return {
-        status: isPrivate ? 'private' : 'public',
-        profileInfo: {
-          fullName: fullName || clean,
-          isVerified: false,
-          biography: '',
-          profilePicUrl: '',
-          postsCount: 0
-        },
-        fallbackMirror: url.includes('greatfon') ? 'greatfon' : 'dumpor',
-        error: null
-      };
     } catch (err) {
       // try next mirror
     }
@@ -421,5 +456,10 @@ function extractProfileInfo(html, cleanUsername) {
 }
 
 module.exports = {
-  checkInstagramProfile
+  checkInstagramProfile,
+  determinePrivacy,
+  extractProfileInfo,
+  decodeHtmlEntities,
+  isBotChallengePage,
+  parseMirrorHtml
 };

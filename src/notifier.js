@@ -20,6 +20,56 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
+function isValidDiscordWebhookUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url.trim());
+    const allowedHosts = new Set([
+      'discord.com',
+      'discordapp.com',
+      'canary.discord.com',
+      'ptb.discord.com'
+    ]);
+    return parsed.protocol === 'https:' &&
+      allowedHosts.has(parsed.hostname.toLowerCase()) &&
+      parsed.pathname.startsWith('/api/webhooks/');
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Retry wrapper with exponential backoff so transient network blips never drop alerts.
+ */
+async function sendWithRetry(fn, { maxRetries = config.ALERT_MAX_RETRIES || 3, baseDelayMs = 1000, label = 'alert' } = {}) {
+  let lastResult = { success: false, error: 'Unknown error' };
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fn(attempt);
+      if (res && res.success) {
+        return { ...res, attempts: attempt + 1 };
+      }
+      lastResult = res || { success: false, error: 'Delivery failed' };
+      // Do not retry permanent 4xx client errors (except 429 rate limit)
+      const errMsg = String(lastResult.error || '');
+      if (/HTTP 4(?!29)\d\d|Unauthorized|Bad Request|chat not found|not configured|Invalid Discord/i.test(errMsg)) {
+        return { ...lastResult, attempts: attempt + 1 };
+      }
+    } catch (err) {
+      lastResult = { success: false, error: err.message };
+    }
+
+    if (attempt < maxRetries) {
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      console.warn(`[Notifier] ${label} attempt ${attempt + 1} failed (${lastResult.error}); retrying in ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  return { ...lastResult, attempts: maxRetries + 1 };
+}
+
 /**
  * Send an alert message to a Telegram chat via Bot API
  */
@@ -103,6 +153,9 @@ async function sendDiscordAlert({ username, previousStatus, currentStatus, profi
   if (!webhookUrl) {
     return { success: false, error: 'Discord Webhook URL not configured' };
   }
+  if (!isValidDiscordWebhookUrl(webhookUrl)) {
+    return { success: false, error: 'Invalid Discord Webhook URL (must start with https://discord.com/api/webhooks/)' };
+  }
 
   const profileUrl = `https://www.instagram.com/${username}/`;
   const nameDisplay = profileInfo?.fullName ? ` (${profileInfo.fullName})` : '';
@@ -166,6 +219,9 @@ async function sendDiscordAlert({ username, previousStatus, currentStatus, profi
 async function testDiscord(webhookUrl) {
   if (!webhookUrl) {
     return { success: false, error: 'Please enter a Discord Webhook URL' };
+  }
+  if (!isValidDiscordWebhookUrl(webhookUrl)) {
+    return { success: false, error: 'Invalid Discord Webhook URL (must start with https://discord.com/api/webhooks/)' };
   }
 
   const payload = {
@@ -240,37 +296,43 @@ async function dispatchTransitionAlert(target, previousStatus, currentStatus, se
     });
   }
 
-  // 1. Telegram
+  // 1. Telegram (with exponential-backoff retry)
   if (settings.telegramToken && settings.telegramChatId) {
     try {
-      const tgRes = await sendTelegramAlert({
-        ...alertInfo,
-        token: settings.telegramToken,
-        chatId: settings.telegramChatId
-      });
+      const tgRes = await sendWithRetry(
+        () => sendTelegramAlert({
+          ...alertInfo,
+          token: settings.telegramToken,
+          chatId: settings.telegramChatId
+        }),
+        { label: `Telegram transition @${target.username}` }
+      );
       results.telegram = tgRes;
       if (tgRes.success) {
         db.addLog(`Telegram alert sent for @${target.username}`, 'success', target.username);
       } else {
-        db.addLog(`Telegram alert failed: ${tgRes.error}`, 'error', target.username);
+        db.addLog(`Telegram alert failed after ${tgRes.attempts} attempt(s): ${tgRes.error}`, 'error', target.username);
       }
     } catch (e) {
       db.addLog(`Telegram error: ${e.message}`, 'error', target.username);
     }
   }
 
-  // 2. Discord
+  // 2. Discord (with exponential-backoff retry)
   if (settings.discordWebhookUrl) {
     try {
-      const dcRes = await sendDiscordAlert({
-        ...alertInfo,
-        webhookUrl: settings.discordWebhookUrl
-      });
+      const dcRes = await sendWithRetry(
+        () => sendDiscordAlert({
+          ...alertInfo,
+          webhookUrl: settings.discordWebhookUrl
+        }),
+        { label: `Discord transition @${target.username}` }
+      );
       results.discord = dcRes;
       if (dcRes.success) {
         db.addLog(`Discord webhook alert sent for @${target.username}`, 'success', target.username);
       } else {
-        db.addLog(`Discord webhook failed: ${dcRes.error}`, 'error', target.username);
+        db.addLog(`Discord webhook failed after ${dcRes.attempts} attempt(s): ${dcRes.error}`, 'error', target.username);
       }
     } catch (e) {
       db.addLog(`Discord error: ${e.message}`, 'error', target.username);
@@ -521,6 +583,9 @@ async function dispatchActivityAlert(type, data, settings, db, broadcastFn) {
 }
 
 module.exports = {
+  escapeHtml,
+  isValidDiscordWebhookUrl,
+  sendWithRetry,
   sendTelegramAlert,
   testTelegram,
   sendDiscordAlert,
