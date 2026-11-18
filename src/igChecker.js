@@ -12,6 +12,7 @@ if (typeof dns.setDefaultResultOrder === 'function') {
 
 const db = require('./db');
 const proxyManager = require('./proxyManager');
+const { httpFetch } = require('./httpClient');
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -134,26 +135,18 @@ async function checkInstagramProfile(username, options = {}) {
     headers['Cookie'] = cookieHeader;
   }
 
-  let fetchOptions = {
+  const fetchOptions = {
     method: 'GET',
     headers,
     redirect: 'follow',
     signal: AbortSignal.timeout(10000) // 10s timeout
   };
 
-  // Rotating Proxy Pool
-  const activeProxy = proxyManager.getNextProxy(options.proxyUrl);
-  if (activeProxy) {
-    try {
-      const { ProxyAgent } = require('undici');
-      fetchOptions.dispatcher = new ProxyAgent(activeProxy);
-    } catch (e) {
-      // ignore
-    }
-  }
-
+  let activeProxy = null;
   try {
-    const response = await fetch(url, fetchOptions);
+    const fetched = await httpFetch(url, fetchOptions, { proxyUrl: options.proxyUrl });
+    const response = fetched.response;
+    activeProxy = fetched.activeProxy;
 
     if (response.status === 429) {
       if (activeProxy) proxyManager.markProxyFailed(activeProxy, 60);

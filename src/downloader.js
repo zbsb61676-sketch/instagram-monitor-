@@ -12,23 +12,38 @@ const { pipeline } = require('stream/promises');
 const config = require('./config');
 const db = require('./db');
 const cacheManager = require('./cacheManager');
-const proxyManager = require('./proxyManager');
-
-// Reusable HTTP Keep-Alive connection pool for high-speed CDN media downloads
-let cdnKeepAliveAgent = null;
-try {
-  const { Agent } = require('undici');
-  cdnKeepAliveAgent = new Agent({
-    connections: 16,
-    keepAliveTimeout: 15000,
-    keepAliveMaxTimeout: 60000,
-    pipelining: 1
-  });
-} catch (e) {}
+const anonyigProvider = require('./anonyigProvider');
+const { httpFetch } = require('./httpClient');
 
 // Ensure base downloads folder exists
 if (!fs.existsSync(config.DOWNLOADS_DIR)) {
   fs.mkdirSync(config.DOWNLOADS_DIR, { recursive: true });
+}
+
+/**
+ * Shared concurrency limiter (semaphore) so nested highlight/carousel/post/story
+ * downloads never exceed the safe global concurrency budget.
+ */
+function createLimiter(maxConcurrent = 6) {
+  const limit = Math.max(1, maxConcurrent);
+  let active = 0;
+  const queue = [];
+
+  return async function runLimited(fn) {
+    if (active >= limit) {
+      await new Promise((resolve) => queue.push(resolve));
+    }
+    active++;
+    try {
+      return await fn();
+    } finally {
+      active--;
+      if (queue.length > 0) {
+        const next = queue.shift();
+        next();
+      }
+    }
+  };
 }
 
 /**
@@ -60,19 +75,18 @@ function formatCookieHeader(sessionCookie) {
   return raw.includes('=') ? raw : `sessionid=${raw}`;
 }
 
-function applyProxy(fetchOptions, proxyUrl, useKeepAlivePool = false) {
-  const activeProxy = proxyManager.getNextProxy(proxyUrl);
-  if (activeProxy) {
-    try {
-      const { ProxyAgent } = require('undici');
-      fetchOptions.dispatcher = new ProxyAgent(activeProxy);
-    } catch (e) {
-      // ignore
-    }
-  } else if (useKeepAlivePool && cdnKeepAliveAgent) {
-    fetchOptions.dispatcher = cdnKeepAliveAgent;
-  }
-  return activeProxy;
+function isLoginWallResponse(res, html = '') {
+  const finalUrl = res?.url || '';
+  return (
+    res?.status === 401 ||
+    res?.status === 403 ||
+    res?.status === 429 ||
+    finalUrl.includes('/accounts/login') ||
+    finalUrl.includes('/challenge/') ||
+    html.includes('<title>Login • Instagram</title>') ||
+    html.includes('"pageID":"CAAIGLoginHomepage"') ||
+    html.includes('checkpoint_required')
+  );
 }
 
 const USER_AGENTS = [
@@ -105,84 +119,89 @@ function getBrowserHeaders() {
 async function downloadFile(url, destPath, options = {}) {
   if (!url) return false;
 
-  const dir = path.dirname(destPath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  const exec = async () => {
+    const dir = path.dirname(destPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
 
-  // Reuse existing valid file if not forced
-  if (options.force !== true && fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
-    return true;
-  }
+    // Reuse existing valid file if not forced
+    if (options.force !== true && fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
+      return true;
+    }
 
-  const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
-  const timeoutMs = options.timeoutMs || 25000;
-  let lastErr = null;
+    const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
+    const timeoutMs = options.timeoutMs || 25000;
+    let lastErr = null;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const tempPath = `${destPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
-    try {
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
-      const signal = options.signal && typeof AbortSignal.any === 'function'
-        ? AbortSignal.any([options.signal, timeoutSignal])
-        : timeoutSignal;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const tempPath = `${destPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+      try {
+        const timeoutSignal = AbortSignal.timeout(timeoutMs);
+        const signal = options.signal && typeof AbortSignal.any === 'function'
+          ? AbortSignal.any([options.signal, timeoutSignal])
+          : timeoutSignal;
 
-      const fetchOptions = {
-        method: 'GET',
-        headers: {
-          'User-Agent': getRandomUserAgent(),
-          'Accept': '*/*',
-          'Referer': 'https://www.instagram.com/'
-        },
-        signal
-      };
+        const fetchOptions = {
+          method: 'GET',
+          headers: {
+            'User-Agent': getRandomUserAgent(),
+            'Accept': '*/*',
+            'Referer': 'https://www.instagram.com/'
+          },
+          signal
+        };
 
-      applyProxy(fetchOptions, options.proxyUrl, true);
+        const { response: res } = await httpFetch(url, fetchOptions, {
+          proxyUrl: options.proxyUrl,
+          useKeepAlive: true
+        });
+        if (!res.ok) {
+          const err = new Error(`HTTP ${res.status} downloading ${url}`);
+          err.status = res.status;
+          throw err;
+        }
 
-      const res = await fetch(url, fetchOptions);
-      if (!res.ok) {
-        const err = new Error(`HTTP ${res.status} downloading ${url}`);
-        err.status = res.status;
-        throw err;
-      }
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (contentType.startsWith('text/html')) {
+          const err = new Error(`Unexpected HTML response downloading ${url}`);
+          err.nonRetryable = true;
+          throw err;
+        }
 
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-      if (contentType.startsWith('text/html')) {
-        const err = new Error(`Unexpected HTML response downloading ${url}`);
-        err.nonRetryable = true;
-        throw err;
-      }
+        if (res.body) {
+          await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tempPath));
+        } else {
+          const buffer = await res.arrayBuffer();
+          fs.writeFileSync(tempPath, Buffer.from(buffer));
+        }
 
-      if (res.body) {
-        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tempPath));
-      } else {
-        const buffer = await res.arrayBuffer();
-        fs.writeFileSync(tempPath, Buffer.from(buffer));
-      }
+        const stat = fs.statSync(tempPath);
+        if (stat.size === 0) {
+          throw new Error(`Empty response body downloading ${url}`);
+        }
 
-      const stat = fs.statSync(tempPath);
-      if (stat.size === 0) {
-        throw new Error(`Empty response body downloading ${url}`);
-      }
-
-      fs.renameSync(tempPath, destPath);
-      return true; // Newly downloaded
-    } catch (err) {
-      lastErr = err;
-      // Always clean up partial temp file on failure
-      if (fs.existsSync(tempPath)) {
-        try { fs.unlinkSync(tempPath); } catch (e) {}
-      }
-      if (err.nonRetryable || (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) || options.signal?.aborted) {
-        throw err;
-      }
-      if (attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+        fs.renameSync(tempPath, destPath);
+        return true; // Newly downloaded
+      } catch (err) {
+        lastErr = err;
+        // Always clean up partial temp file on failure
+        if (fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch (e) {}
+        }
+        if (err.nonRetryable || (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) || options.signal?.aborted) {
+          throw err;
+        }
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+        }
       }
     }
-  }
 
-  throw lastErr || new Error(`Failed downloading ${url}`);
+    throw lastErr || new Error(`Failed downloading ${url}`);
+  };
+
+  return typeof options._limiter === 'function' ? options._limiter(exec) : exec();
 }
 
 /**
@@ -383,16 +402,14 @@ async function fetchPostSlides(shortcode, options = {}) {
     slideHeaders['Cookie'] = cookieHeader;
   }
 
-  let fetchOptions = {
+  const fetchOptions = {
     method: 'GET',
     headers: slideHeaders,
     signal: AbortSignal.timeout(15000)
   };
 
-  applyProxy(fetchOptions, options.proxyUrl);
-
   try {
-    const res = await fetch(url, fetchOptions);
+    const { response: res } = await httpFetch(url, fetchOptions, { proxyUrl: options.proxyUrl });
     if (!res.ok) return slides;
 
     const html = await res.text();
@@ -502,9 +519,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
         signal: AbortSignal.timeout(15000)
       };
 
-      applyProxy(hlFetchOptions, options.proxyUrl);
-
-      const res = await fetch(hlUrl, hlFetchOptions);
+      const { response: res } = await httpFetch(hlUrl, hlFetchOptions, { proxyUrl: options.proxyUrl });
       if (res.ok) {
         const html = await res.text();
         const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
@@ -570,8 +585,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
           },
           signal: AbortSignal.timeout(12000)
         };
-        applyProxy(mobFetchOptions, options.proxyUrl);
-        const mobRes = await fetch(mobileHlUrl, mobFetchOptions);
+        const { response: mobRes } = await httpFetch(mobileHlUrl, mobFetchOptions, { proxyUrl: options.proxyUrl });
         if (mobRes.ok) {
           const mobData = await mobRes.json();
           const reel = mobData?.reels?.[`highlight:${hlId}`] || mobData?.reels?.[hlId];
@@ -598,8 +612,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
           },
           signal: AbortSignal.timeout(12000)
         };
-        applyProxy(webReelsOptions, options.proxyUrl);
-        const webRes = await fetch(webHlUrl, webReelsOptions);
+        const { response: webRes } = await httpFetch(webHlUrl, webReelsOptions, { proxyUrl: options.proxyUrl });
         if (webRes.ok) {
           const webData = await webRes.json();
           const reel = webData?.reels?.[`highlight:${hlId}`] || webData?.reels?.[hlId] || webData?.reels_media?.[0];
@@ -748,6 +761,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
   const startedAt = Date.now();
   const downloadConcurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
   const metaConcurrency = options.metadataConcurrency || config.METADATA_CONCURRENCY || 3;
+  const dlOptions = { ...options, _limiter: options._limiter || createLimiter(downloadConcurrency) };
 
   const summary = {
     username: clean,
@@ -757,46 +771,189 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     downloadedItems: [],
     errors: [],
     durationMs: 0,
-    itemsPerSec: 0
+    itemsPerSec: 0,
+    source: 'instagram'
   };
 
   db.addLog(`Starting high-speed ${isCache ? 'temporary ' : ''}content download (concurrency=${downloadConcurrency}) for @${clean}...`, 'info', clean);
 
   try {
-    // 1. Fetch profile HTML page
+    let html = '';
+    let userId = null;
+    let avatarUrl = null;
+    let fullName = '';
+    let bio = '';
+    let isPrivateProfile = false;
+    let allMedia = [];
+    let scripts = [];
+    let stage1Blocked = false;
+
+    // Stage 1: Direct Instagram Profile HTML
     const profileUrl = `https://www.instagram.com/${clean}/`;
     const profileHeaders = getBrowserHeaders();
     const profileCookie = formatCookieHeader(options.sessionCookie);
     if (profileCookie) {
       profileHeaders['Cookie'] = profileCookie;
     }
-    let fetchOptions = {
-      method: 'GET',
-      headers: profileHeaders,
-      redirect: 'follow',
-      signal: AbortSignal.timeout(15000)
-    };
 
-    applyProxy(fetchOptions, options.proxyUrl);
-
-    let res = await fetch(profileUrl, fetchOptions);
-    if (profileCookie && (res.status === 401 || res.status === 403 || res.url.includes('/accounts/login') || res.url.includes('/challenge/'))) {
-      // Retry anonymously if cookie triggered a login/checkpoint challenge
-      const anonOptions = {
+    try {
+      let { response: res } = await httpFetch(profileUrl, {
         method: 'GET',
-        headers: getBrowserHeaders(),
+        headers: profileHeaders,
         redirect: 'follow',
         signal: AbortSignal.timeout(15000)
-      };
-      applyProxy(anonOptions, options.proxyUrl);
-      res = await fetch(profileUrl, anonOptions);
-    }
-    if (!res.ok) {
-      throw new Error(`Profile request returned HTTP ${res.status}`);
+      }, { proxyUrl: options.proxyUrl });
+
+      if (profileCookie && isLoginWallResponse(res)) {
+        // Retry anonymously if cookie triggered a login/checkpoint challenge
+        const retry = await httpFetch(profileUrl, {
+          method: 'GET',
+          headers: getBrowserHeaders(),
+          redirect: 'follow',
+          signal: AbortSignal.timeout(15000)
+        }, { proxyUrl: options.proxyUrl });
+        res = retry.response;
+      }
+
+      if (res.status === 404) {
+        throw new Error(`Account @${clean} does not exist (HTTP 404)`);
+      }
+
+      if (res.ok) {
+        html = await res.text();
+        if (isLoginWallResponse(res, html)) {
+          stage1Blocked = true;
+          html = '';
+        } else {
+          if (/this account is private|follow to see their photos and videos/i.test(html)) {
+            isPrivateProfile = true;
+          }
+          const details = extractProfileDetails(html, clean);
+          userId = details.userId;
+          avatarUrl = details.avatarUrl;
+          fullName = details.fullName;
+          bio = details.bio;
+
+          scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+          for (const scriptContent of scripts) {
+            if (scriptContent.includes('display_uri') || scriptContent.includes('display_url') || scriptContent.includes('video_url') || scriptContent.includes('carousel') || scriptContent.includes('edge_owner_to_timeline_media')) {
+              try {
+                const parsed = JSON.parse(scriptContent);
+                const found = extractMediaObjects(parsed);
+                allMedia.push(...found);
+              } catch (e) {}
+            }
+          }
+        }
+      } else {
+        stage1Blocked = true;
+        summary.errors.push(`Direct Instagram HTML returned HTTP ${res.status}`);
+      }
+    } catch (stage1Err) {
+      if (stage1Err.message && stage1Err.message.includes('HTTP 404')) {
+        throw stage1Err;
+      }
+      stage1Blocked = true;
+      summary.errors.push(`Direct fetch fallback triggered: ${stage1Err.message}`);
     }
 
-    const html = await res.text();
-    const { userId, avatarUrl, fullName, bio } = extractProfileDetails(html, clean);
+    // Stage 2: Instagram Web Profile Info API Fallback (when Stage 1 is blocked or returned 0 posts)
+    if ((stage1Blocked || allMedia.length === 0) && !isPrivateProfile) {
+      try {
+        const apiUrl = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(clean)}`;
+        const apiHeaders = {
+          'User-Agent': getRandomUserAgent(),
+          'X-IG-App-ID': '936619743392459',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': '*/*',
+          'Referer': `https://www.instagram.com/${clean}/`,
+          ...(profileCookie ? { 'Cookie': profileCookie } : {})
+        };
+        const { response: apiRes } = await httpFetch(apiUrl, {
+          method: 'GET',
+          headers: apiHeaders,
+          signal: AbortSignal.timeout(12000)
+        }, { proxyUrl: options.proxyUrl });
+
+        if (apiRes.ok) {
+          const apiData = await apiRes.json();
+          const user = apiData?.data?.user;
+          if (user) {
+            summary.source = 'instagram_api';
+            userId = userId || (user.id ? String(user.id) : null);
+            avatarUrl = avatarUrl || user.profile_pic_url_hd || user.profile_pic_url || null;
+            fullName = fullName || user.full_name || '';
+            bio = bio || user.biography || '';
+            if (user.is_private === true) {
+              isPrivateProfile = true;
+            }
+            const edges = user.edge_owner_to_timeline_media?.edges || [];
+            for (const edge of edges) {
+              const node = edge?.node;
+              if (!node) continue;
+              const code = node.shortcode || String(node.id);
+              const captionText = node.edge_media_to_caption?.edges?.[0]?.node?.text || '';
+              const sidecarEdges = node.edge_sidecar_to_children?.edges || [];
+              const preloadedSlides = sidecarEdges.map((se, i) => ({
+                index: i + 1,
+                id: String(se.node?.id || `${code}_${i + 1}`),
+                isVideo: Boolean(se.node?.is_video && se.node?.video_url),
+                url: (se.node?.is_video && se.node?.video_url) ? se.node.video_url : se.node?.display_url,
+                displayUrl: se.node?.display_url || null
+              })).filter(s => Boolean(s.url));
+
+              allMedia.push({
+                pk: String(node.id || code),
+                code: String(code),
+                displayUrl: node.display_url || null,
+                videoUrl: node.video_url || null,
+                isVideo: Boolean(node.is_video),
+                isCarousel: preloadedSlides.length > 1,
+                carouselCount: preloadedSlides.length,
+                preloadedSlides: preloadedSlides.length > 1 ? preloadedSlides : null,
+                caption: captionText,
+                productType: preloadedSlides.length > 1 ? 'carousel_container' : 'feed',
+                canonicalUrl: `https://www.instagram.com/p/${code}/`
+              });
+            }
+          }
+        }
+      } catch (apiErr) {
+        summary.errors.push(`Web API fallback error: ${apiErr.message}`);
+      }
+    }
+
+    // Stage 3: Anonymous Public Mirror Fallback (works even when Render datacenter IPs are blocked by Instagram)
+    if (allMedia.length === 0 && !isPrivateProfile && stage1Blocked) {
+      try {
+        const mirrorRes = await anonyigProvider.fetchPublicMirrorMedia(clean);
+        if (mirrorRes && mirrorRes.success && Array.isArray(mirrorRes.items) && mirrorRes.items.length > 0) {
+          summary.source = `mirror_${mirrorRes.provider || 'public'}`;
+          mirrorRes.items.forEach((m, idx) => {
+            if (m.url) {
+              allMedia.push({
+                pk: `mirror_${idx + 1}`,
+                code: `mirror_${idx + 1}`,
+                displayUrl: m.url,
+                videoUrl: null,
+                isVideo: false,
+                isCarousel: false,
+                carouselCount: 0,
+                caption: `Public post via anonymous mirror (${mirrorRes.provider || 'mirror'})`,
+                productType: 'feed',
+                canonicalUrl: `https://www.instagram.com/${clean}/`
+              });
+            }
+          });
+        }
+      } catch (mirrorErr) {
+        summary.errors.push(`Mirror fallback error: ${mirrorErr.message}`);
+      }
+    }
+
+    if (isPrivateProfile && allMedia.length === 0) {
+      summary.isPrivate = true;
+    }
 
     // Save profile bio text
     if (bio || fullName || userId) {
@@ -807,20 +964,6 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
         userId,
         updatedAt: new Date().toISOString()
       }, null, 2));
-    }
-
-    // 2. Parse Posts, Reels, & Highlights from Relay Scripts
-    const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
-    let allMedia = [];
-
-    for (const scriptContent of scripts) {
-      if (scriptContent.includes('display_uri') || scriptContent.includes('display_url') || scriptContent.includes('video_url') || scriptContent.includes('carousel') || scriptContent.includes('edge_owner_to_timeline_media')) {
-        try {
-          const parsed = JSON.parse(scriptContent);
-          const found = extractMediaObjects(parsed);
-          allMedia.push(...found);
-        } catch (e) {}
-      }
     }
 
     // Unique posts map by pk / code
@@ -854,13 +997,13 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     }
     summary.totalFound += highlights.length;
 
-    // 4. Execute Avatar, Highlights, Posts/Carousels, and Active Stories IN PARALLEL!
+    // 4. Execute Avatar, Highlights, Posts/Carousels, and Active Stories IN PARALLEL (bounded by shared _limiter)!
     const avatarTask = async () => {
       if (!avatarUrl) return;
       const avatarPath = path.join(profileDir, 'avatar.jpg');
       const avatarMediaId = `avatar_${clean}`;
       try {
-        const downloaded = await downloadFile(avatarUrl, avatarPath, options);
+        const downloaded = await downloadFile(avatarUrl, avatarPath, dlOptions);
         if (downloaded) {
           summary.newlyDownloaded++;
           const item = recordMedia({
@@ -886,7 +1029,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 
     const highlightsTask = async () => {
       if (highlights.length === 0) return;
-      const hlResult = await downloadAllHighlights(clean, highlights, highlightsDir, options, onProgress);
+      const hlResult = await downloadAllHighlights(clean, highlights, highlightsDir, dlOptions, onProgress);
       summary.newlyDownloaded += hlResult.newlyDownloaded;
       summary.downloadedItems.push(...hlResult.items);
       if (hlResult.errors?.length > 0) {
@@ -922,7 +1065,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
           if (isVideoWithSource) {
             // Download MP4 video and thumbnail simultaneously
             const dlTasks = [
-              downloadFile(post.videoUrl, mainPath, options)
+              downloadFile(post.videoUrl, mainPath, dlOptions)
                 .then(vidDl => {
                   if (vidDl || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
                     fileReady = true;
@@ -931,14 +1074,14 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
             ];
             if (post.displayUrl) {
               dlTasks.push(
-                downloadFile(post.displayUrl, thumbPath, options)
+                downloadFile(post.displayUrl, thumbPath, dlOptions)
                   .then(() => { downloadedThumb = true; })
                   .catch(() => {})
               );
             }
             await Promise.all(dlTasks);
           } else if (post.displayUrl) {
-            const imgDownloaded = await downloadFile(post.displayUrl, mainPath, options);
+            const imgDownloaded = await downloadFile(post.displayUrl, mainPath, dlOptions);
             if (imgDownloaded || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
               fileReady = true;
             }
@@ -974,7 +1117,9 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       });
 
       const carouselDownloadPromise = runWithConcurrency(carouselPosts, metaConcurrency, async (post) => {
-        const slides = await fetchPostSlides(post.code, options);
+        const slides = Array.isArray(post.preloadedSlides) && post.preloadedSlides.length > 0
+          ? post.preloadedSlides
+          : await fetchPostSlides(post.code, dlOptions);
         if (slides.length > 0) {
           summary.totalFound += slides.length;
 
@@ -995,14 +1140,14 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
               let downloaded = false;
 
               const slideTasks = [
-                downloadFile(slide.url, destPath, options).then(ok => { downloaded = ok; })
+                downloadFile(slide.url, destPath, dlOptions).then(ok => { downloaded = ok; })
               ];
 
               if (slide.isVideo && slide.displayUrl) {
                 const thumbFileName = `${post.code}_slide_${slide.index}_thumb.jpg`;
                 const tPath = path.join(postsDir, thumbFileName);
                 slideTasks.push(
-                  downloadFile(slide.displayUrl, tPath, options)
+                  downloadFile(slide.displayUrl, tPath, dlOptions)
                     .then(() => {
                       thumbnailPath = tPath;
                       thumbnailUrl = `${urlPrefix}/${clean}/posts/${thumbFileName}`;
@@ -1047,7 +1192,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
           const mainFileName = `${post.code}.${ext}`;
           const mainPath = path.join(postsDir, mainFileName);
           try {
-            const downloaded = await downloadFile(post.isVideo && post.videoUrl ? post.videoUrl : post.displayUrl, mainPath, options);
+            const downloaded = await downloadFile(post.isVideo && post.videoUrl ? post.videoUrl : post.displayUrl, mainPath, dlOptions);
             if (downloaded) {
               summary.newlyDownloaded++;
               const record = recordMedia({
@@ -1077,7 +1222,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 
     const storiesTask = async () => {
       try {
-        const storiesResult = await downloadActiveStories(clean, userId, storiesDir, options, onProgress);
+        const storiesResult = await downloadActiveStories(clean, userId, storiesDir, dlOptions, onProgress);
         summary.newlyDownloaded += storiesResult.newlyDownloaded;
         summary.downloadedItems.push(...storiesResult.items);
       } catch (storyErr) {
@@ -1102,7 +1247,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       : summary.newlyDownloaded;
 
     db.addLog(
-      `Content download complete for @${clean}: ${summary.newlyDownloaded} media files in ${(summary.durationMs / 1000).toFixed(1)}s (${summary.itemsPerSec} files/s).`,
+      `Content download complete for @${clean}: ${summary.newlyDownloaded} media files in ${(summary.durationMs / 1000).toFixed(1)}s (${summary.itemsPerSec} files/s, source=${summary.source}).`,
       summary.newlyDownloaded > 0 ? 'success' : 'info',
       clean
     );
@@ -1162,9 +1307,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
       signal: AbortSignal.timeout(15000)
     };
 
-    applyProxy(webFetchOptions, options.proxyUrl);
-
-    const res = await fetch(webStoriesUrl, webFetchOptions);
+    const { response: res } = await httpFetch(webStoriesUrl, webFetchOptions, { proxyUrl: options.proxyUrl });
     if (res.ok) {
       const html = await res.text();
       const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
@@ -1239,9 +1382,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
         signal: AbortSignal.timeout(10000)
       };
 
-      applyProxy(mobileFetchOptions, options.proxyUrl);
-
-      const res = await fetch(mobileUrl, mobileFetchOptions);
+      const { response: res } = await httpFetch(mobileUrl, mobileFetchOptions, { proxyUrl: options.proxyUrl });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data?.reel?.items) && data.reel.items.length > 0) {
@@ -1268,9 +1409,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
         signal: AbortSignal.timeout(10000)
       };
 
-      applyProxy(reelsFetchOptions, options.proxyUrl);
-
-      const res = await fetch(webUrl, reelsFetchOptions);
+      const { response: res } = await httpFetch(webUrl, reelsFetchOptions, { proxyUrl: options.proxyUrl });
       if (res.ok) {
         const data = await res.json();
         const reel = data?.reels?.[userId] || data?.reels_media?.[0];
@@ -1510,8 +1649,7 @@ async function fetchHighlights(username, options = {}) {
         },
         signal: AbortSignal.timeout(10000)
       };
-      applyProxy(cookieFetchOptions, options.proxyUrl);
-      const res = await fetch(profileUrl, cookieFetchOptions);
+      const { response: res } = await httpFetch(profileUrl, cookieFetchOptions, { proxyUrl: options.proxyUrl });
       if (res.ok) {
         const html = await res.text();
         const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);

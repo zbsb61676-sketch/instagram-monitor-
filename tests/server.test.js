@@ -141,5 +141,12 @@ describe('Server HTTP, WebSocket & Auth Integration', () => {
     assert.ok(!initMsg.data.settings.telegramToken.includes('SUPER_SECRET'));
     assert.ok(!initMsg.data.settings.sessionCookie.includes('secret_ig_cookie'));
     ws.close();
+
+    // Verify /api/cache/status/:username responds cleanly
+    const statusRes = await fetch(`${srv.baseUrl}/api/cache/status/nonexistent_demo`, { headers });
+    assert.equal(statusRes.status, 200);
+    const statusJson = await statusRes.json();
+    assert.equal(statusJson.status, 'idle');
+    assert.equal(statusJson.count, 0);
   });
 });

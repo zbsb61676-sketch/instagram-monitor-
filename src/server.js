@@ -514,6 +514,9 @@ app.delete('/api/targets/:id', (req, res) => {
   res.json({ success: true, id: target.id });
 });
 
+// Active background live download job tracking (prevents Render/proxy HTTP timeouts)
+const activeLiveDownloads = new Map(); // username -> { status, startedAt, completedAt, summary, error }
+
 // Download Content Endpoints
 app.post('/api/targets/:id/download', heavyEndpointLimiter, async (req, res) => {
   const target = db.getTarget(req.params.id);
@@ -522,7 +525,9 @@ app.post('/api/targets/:id/download', heavyEndpointLimiter, async (req, res) => 
   }
 
   const settings = db.getSettings();
-  try {
+  const isAsync = req.body?.async === true || req.query.async === 'true';
+
+  const runJob = async () => {
     const summary = await downloadTargetContent(target.username, {
       proxyUrl: settings.proxyUrl,
       sessionCookie: settings.sessionCookie
@@ -538,11 +543,28 @@ app.post('/api/targets/:id/download', heavyEndpointLimiter, async (req, res) => 
         totalDownloaded: updatedMedia.length
       }
     });
+    return { summary, totalDownloaded: updatedMedia.length };
+  };
 
+  if (isAsync) {
+    runJob().catch(err => {
+      db.addLog(`Background download failed for @${target.username}: ${err.message}`, 'error', target.username);
+    });
+    return res.status(202).json({
+      success: true,
+      async: true,
+      targetId: target.id,
+      username: target.username,
+      message: `Download started in background for @${target.username}`
+    });
+  }
+
+  try {
+    const { summary, totalDownloaded } = await runJob();
     res.json({
       success: true,
       summary,
-      totalDownloaded: updatedMedia.length
+      totalDownloaded
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -565,7 +587,7 @@ app.get('/api/targets/:id/downloads', (req, res) => {
 
 // Ephemeral Cache: Inspect & Cache Profile Media (Real-Time Live Download)
 app.post(['/api/cache/inspect', '/api/download-live'], heavyEndpointLimiter, async (req, res) => {
-  const { username } = req.body;
+  const { username, async: asyncMode } = req.body;
   if (!username) {
     return res.status(400).json({ error: 'Username is required' });
   }
@@ -575,55 +597,110 @@ app.post(['/api/cache/inspect', '/api/download-live'], heavyEndpointLimiter, asy
     return res.status(400).json({ error: 'Invalid username format' });
   }
   const settings = db.getSettings();
+  const isAsync = asyncMode === true || req.query.async === 'true';
 
   // Clear previous cache for this user to ensure fresh, real-time data from Instagram
   cacheManager.clearUserCache(clean);
 
+  const jobState = {
+    username: clean,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    summary: null,
+    error: null
+  };
+  activeLiveDownloads.set(clean, jobState);
+
   broadcast({
     type: 'LIVE_DOWNLOAD_STARTED',
-    data: { username: clean, timestamp: new Date().toISOString() }
+    data: { username: clean, timestamp: jobState.startedAt }
   });
 
-  try {
-    const summary = await downloadTargetContent(clean, {
-      proxyUrl: settings.proxyUrl,
-      sessionCookie: settings.sessionCookie,
-      isCache: true
-    }, (progressEvent) => {
+  const executeLiveDownload = async () => {
+    try {
+      const summary = await downloadTargetContent(clean, {
+        proxyUrl: settings.proxyUrl,
+        sessionCookie: settings.sessionCookie,
+        isCache: true
+      }, (progressEvent) => {
+        broadcast({
+          type: 'LIVE_ITEM_DOWNLOADED',
+          data: {
+            username: clean,
+            item: progressEvent.item,
+            current: progressEvent.current,
+            total: progressEvent.total
+          }
+        });
+      });
+
+      const cachedItems = cacheManager.getCachedItems(clean);
+      jobState.status = 'completed';
+      jobState.completedAt = new Date().toISOString();
+      jobState.summary = summary;
+
       broadcast({
-        type: 'LIVE_ITEM_DOWNLOADED',
+        type: 'LIVE_DOWNLOAD_COMPLETED',
         data: {
           username: clean,
-          item: progressEvent.item,
-          current: progressEvent.current,
-          total: progressEvent.total
+          summary,
+          totalItems: cachedItems.length,
+          items: cachedItems
         }
       });
-    });
 
-    const cachedItems = cacheManager.getCachedItems(clean);
-    broadcast({
-      type: 'LIVE_DOWNLOAD_COMPLETED',
-      data: {
-        username: clean,
-        summary,
-        totalItems: cachedItems.length,
-        items: cachedItems
-      }
-    });
+      return { summary, items: cachedItems };
+    } catch (err) {
+      jobState.status = 'failed';
+      jobState.completedAt = new Date().toISOString();
+      jobState.error = err.message;
+      broadcast({
+        type: 'LIVE_DOWNLOAD_FAILED',
+        data: { username: clean, error: err.message }
+      });
+      throw err;
+    }
+  };
 
+  if (isAsync) {
+    executeLiveDownload().catch(() => {});
+    return res.status(202).json({
+      success: true,
+      async: true,
+      username: clean,
+      status: 'running'
+    });
+  }
+
+  try {
+    const { summary, items } = await executeLiveDownload();
     res.json({
       success: true,
       summary,
-      items: cachedItems
+      items
     });
   } catch (err) {
-    broadcast({
-      type: 'LIVE_DOWNLOAD_FAILED',
-      data: { username: clean, error: err.message }
-    });
     res.status(500).json({ error: err.message });
   }
+});
+
+// Poll live temporary download job status (fallback if WebSocket briefly reconnects)
+app.get('/api/cache/status/:username', (req, res) => {
+  const clean = cleanHandle(req.params.username);
+  if (!clean) return res.status(400).json({ error: 'Invalid username format' });
+  const job = activeLiveDownloads.get(clean);
+  const items = cacheManager.getCachedItems(clean);
+  res.json({
+    username: clean,
+    status: job ? job.status : (items.length > 0 ? 'completed' : 'idle'),
+    startedAt: job?.startedAt || null,
+    completedAt: job?.completedAt || null,
+    summary: job?.summary || null,
+    error: job?.error || null,
+    count: items.length,
+    items
+  });
 });
 
 // Get current cached items for a user

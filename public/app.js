@@ -170,6 +170,51 @@ const transitionAlertLink = document.getElementById('transitionAlertLink');
 const dismissAlertBtn = document.getElementById('dismissAlertBtn');
 
 let liveStreamTimer = null;
+let livePollTimer = null;
+
+function stopLivePoll() {
+  if (livePollTimer) {
+    clearInterval(livePollTimer);
+    livePollTimer = null;
+  }
+}
+
+function finishLiveDownloadUI(username, items, summary) {
+  stopLivePoll();
+  if (startLiveDownloadBtn) {
+    startLiveDownloadBtn.disabled = false;
+    startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> <span>Live Download Profile</span>';
+  }
+  const safeItems = Array.isArray(items) ? items : [];
+  if (safeItems.length > 0) {
+    const durSec = summary?.durationMs ? ` in ${(summary.durationMs / 1000).toFixed(1)}s` : '';
+    const speedStr = summary?.itemsPerSec ? ` (${summary.itemsPerSec}/s)` : '';
+    if (liveStatusText) {
+      liveStatusText.textContent = `✅ Ready: ${safeItems.length} temp items cached for @${username}${durSec}${speedStr}`;
+    }
+    if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
+    for (const item of safeItems) {
+      appendLiveMediaCard({ item, username, current: safeItems.length, total: safeItems.length }, false, true);
+    }
+    updateSelectionUI();
+  } else {
+    const errMsg = summary?.isPrivate
+      ? `@${username} is a PRIVATE account — posts & stories cannot be downloaded anonymously.`
+      : (summary?.errors?.length ? summary.errors[0] : 'This account currently has 0 posts, highlights, or active stories.');
+    if (liveMediaStreamGrid && cachedMediaItems.length === 0) {
+      liveMediaStreamGrid.innerHTML = `
+        <div class="col-span-full py-8 text-center text-gray-400">
+          <i class="fa-solid ${summary?.isPrivate ? 'fa-lock text-amber-400' : 'fa-camera text-gray-600'} text-3xl mb-2"></i>
+          <p class="text-sm font-semibold text-gray-300">No media downloaded for @${escapeHtml(username)}</p>
+          <p class="text-xs text-gray-500 mt-1">${escapeHtml(errMsg)}</p>
+        </div>
+      `;
+    }
+    if (liveStatusText) liveStatusText.textContent = summary?.isPrivate ? `🔒 @${username} is private` : `⚠️ No media returned for @${username}`;
+    if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-500';
+    updateSelectionUI();
+  }
+}
 
 // --- WebSocket Connection ---
 let socket = null;
@@ -315,17 +360,20 @@ function handleSocketMessage(msg) {
       break;
 
     case 'LIVE_DOWNLOAD_COMPLETED':
-      if (liveDownloadStatusBox) {
-        const durSec = msg.data.summary?.durationMs ? ` in ${(msg.data.summary.durationMs / 1000).toFixed(1)}s` : '';
-        const speedStr = msg.data.summary?.itemsPerSec ? ` (${msg.data.summary.itemsPerSec}/s)` : '';
-        liveStatusText.textContent = `✅ Ready: ${msg.data.totalItems} temp items cached for @${msg.data.username}${durSec}${speedStr}`;
-        liveItemCounter.textContent = `${msg.data.totalItems} items`;
-        if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
+      if (msg.data && (!activeCacheUsername || msg.data.username === activeCacheUsername)) {
+        finishLiveDownloadUI(msg.data.username, msg.data.items || cachedMediaItems, msg.data.summary);
+        if ((msg.data.totalItems || 0) > 0) {
+          showToast(`✅ Profile @${msg.data.username} cached (${msg.data.totalItems} items)! Click Download All (.ZIP) or pick files.`, 'success');
+        }
       }
-      showToast(`✅ Profile @${msg.data.username} cached! Select items or click Download All (.ZIP).`, 'success');
       break;
 
     case 'LIVE_DOWNLOAD_FAILED':
+      stopLivePoll();
+      if (startLiveDownloadBtn) {
+        startLiveDownloadBtn.disabled = false;
+        startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> <span>Live Download Profile</span>';
+      }
       if (liveStatusText) {
         liveStatusText.textContent = `❌ Error: ${msg.data.error}`;
       }
@@ -1102,9 +1150,10 @@ if (clearCacheBtn) {
 if (liveDownloadForm) {
   liveDownloadForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const username = liveDownloadUsername.value.trim().replace(/^@/, '');
+    const username = liveDownloadUsername.value.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9._]/g, '');
     if (!username) return;
 
+    stopLivePoll();
     activeCacheUsername = username;
     cachedMediaItems = [];
     selectedMediaIds.clear();
@@ -1112,10 +1161,10 @@ if (liveDownloadForm) {
     notifyViewingCache(username);
 
     startLiveDownloadBtn.disabled = true;
-    startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Downloading to Cache...';
+    startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Downloading to Temp Cache...';
     liveDownloadStatusBox.classList.remove('hidden');
     liveMediaStreamGrid.innerHTML = '';
-    liveStatusText.textContent = `Connecting to Instagram and downloading @${username} into cache...`;
+    liveStatusText.textContent = `Connecting to Instagram and streaming @${username} into temporary cache...`;
     liveItemCounter.textContent = '0 items';
     if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping';
 
@@ -1123,43 +1172,55 @@ if (liveDownloadForm) {
       const res = await fetch('/api/cache/inspect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username })
+        body: JSON.stringify({ username, async: true })
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Live download failed');
 
-      if (data.items && data.items.length > 0) {
-        const total = data.items.length;
-        const durSec = data.summary?.durationMs ? ` in ${(data.summary.durationMs / 1000).toFixed(1)}s` : '';
-        const speedStr = data.summary?.itemsPerSec ? ` (${data.summary.itemsPerSec}/s)` : '';
-        liveStatusText.textContent = `⚡ Ready: ${total} temp items cached for @${username}${durSec}${speedStr}. Click Download All or select items:`;
-        if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
+      const contentType = res.headers.get('content-type') || '';
+      const data = contentType.includes('application/json')
+        ? await res.json()
+        : { error: `Server returned HTTP ${res.status}` };
 
-        // Reconcile without wiping cards already streamed live over WebSocket
-        if (liveStreamTimer) {
-          clearInterval(liveStreamTimer);
-          liveStreamTimer = null;
-        }
-        for (const item of data.items) {
-          appendLiveMediaCard({ item, username, current: total, total }, false, true);
-        }
-        updateSelectionUI();
+      if (!res.ok) throw new Error(data.error || `Live download failed (HTTP ${res.status})`);
+
+      if (data.async) {
+        // Non-blocking background job started (immune to Render/proxy HTTP timeouts).
+        // WebSocket pushes items live; fallback poller syncs every 2.5s in case WS reconnects.
+        livePollTimer = setInterval(async () => {
+          if (activeCacheUsername !== username) {
+            stopLivePoll();
+            return;
+          }
+          try {
+            const stRes = await fetch(`/api/cache/status/${encodeURIComponent(username)}`);
+            if (!stRes.ok) return;
+            const st = await stRes.json();
+            if (Array.isArray(st.items) && st.items.length > 0) {
+              for (const item of st.items) {
+                appendLiveMediaCard({ item, username, current: st.items.length, total: st.items.length }, false, true);
+              }
+            }
+            if (st.status === 'completed') {
+              finishLiveDownloadUI(username, st.items, st.summary);
+            } else if (st.status === 'failed') {
+              stopLivePoll();
+              startLiveDownloadBtn.disabled = false;
+              startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> <span>Live Download Profile</span>';
+              liveStatusText.textContent = `❌ ${st.error || 'Download failed'}`;
+              if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
+              showToast(st.error || 'Download failed', 'error');
+            }
+          } catch (pollErr) {
+            // transient network hiccup; retry next tick
+          }
+        }, 2500);
       } else {
-        liveMediaStreamGrid.innerHTML = `
-          <div class="col-span-full py-8 text-center text-gray-400">
-            <i class="fa-solid fa-camera text-3xl mb-2 text-gray-600"></i>
-            <p class="text-sm font-semibold text-gray-300">No media found for @${escapeHtml(username)}</p>
-            <p class="text-xs text-gray-500 mt-1">This account currently has 0 posts, highlights, or active stories.</p>
-          </div>
-        `;
-        liveStatusText.textContent = `@${username} has no available media`;
-        if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-gray-500';
+        finishLiveDownloadUI(username, data.items, data.summary);
       }
     } catch (err) {
+      stopLivePoll();
       showToast(err.message, 'error');
       liveStatusText.textContent = `❌ ${err.message}`;
       if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
-    } finally {
       startLiveDownloadBtn.disabled = false;
       startLiveDownloadBtn.innerHTML = '<i class="fa-solid fa-cloud-arrow-down"></i> <span>Live Download Profile</span>';
     }
@@ -1517,12 +1578,23 @@ window.triggerDownload = async (targetId, btn) => {
     const icon = btn.querySelector('i');
     if (icon) icon.className = 'fa-solid fa-spinner fa-spin';
 
-    showToast('Extracting and downloading content...', 'info');
-    const res = await fetch(`/api/targets/${targetId}/download`, { method: 'POST' });
-    const data = await res.json();
+    showToast('Starting high-speed background download...', 'info');
+    const res = await fetch(`/api/targets/${targetId}/download`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ async: true })
+    });
+    const contentType = res.headers.get('content-type') || '';
+    const data = contentType.includes('application/json')
+      ? await res.json()
+      : { error: `Server returned HTTP ${res.status}` };
     if (!res.ok) throw new Error(data.error || 'Failed to download');
 
-    showToast(`✅ Downloaded ${data.summary.newlyDownloaded} new files (${data.summary.skipped} skipped)`, 'success');
+    if (data.async) {
+      showToast(`⚡ Downloading @${data.username} in background — gallery will update live!`, 'info');
+    } else {
+      showToast(`✅ Downloaded ${data.summary.newlyDownloaded} new files (${data.summary.skipped} skipped)`, 'success');
+    }
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
