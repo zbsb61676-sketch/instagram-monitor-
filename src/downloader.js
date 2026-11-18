@@ -10,10 +10,30 @@ const path = require('path');
 const config = require('./config');
 const db = require('./db');
 const cacheManager = require('./cacheManager');
+const proxyManager = require('./proxyManager');
 
 // Ensure base downloads folder exists
 if (!fs.existsSync(config.DOWNLOADS_DIR)) {
   fs.mkdirSync(config.DOWNLOADS_DIR, { recursive: true });
+}
+
+function formatCookieHeader(sessionCookie) {
+  const raw = (sessionCookie || '').trim();
+  if (!raw) return '';
+  return raw.includes('=') ? raw : `sessionid=${raw}`;
+}
+
+function applyProxy(fetchOptions, proxyUrl) {
+  const activeProxy = proxyManager.getNextProxy(proxyUrl);
+  if (activeProxy) {
+    try {
+      const { ProxyAgent } = require('undici');
+      fetchOptions.dispatcher = new ProxyAgent(activeProxy);
+    } catch (e) {
+      // ignore
+    }
+  }
+  return activeProxy;
 }
 
 const USER_AGENTS = [
@@ -65,22 +85,20 @@ async function downloadFile(url, destPath, options = {}) {
     signal: AbortSignal.timeout(25000)
   };
 
-  if (options.proxyUrl) {
-    try {
-      const { ProxyAgent } = require('undici');
-      fetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-    } catch (e) {
-      // ignore
-    }
-  }
+  applyProxy(fetchOptions, options.proxyUrl);
 
   const res = await fetch(url, fetchOptions);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} downloading ${url}`);
   }
 
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (contentType.startsWith('text/html')) {
+    throw new Error(`Unexpected HTML response downloading ${url}`);
+  }
+
   const buffer = await res.arrayBuffer();
-  const tempPath = `${destPath}.tmp`;
+  const tempPath = `${destPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
   fs.writeFileSync(tempPath, Buffer.from(buffer));
   fs.renameSync(tempPath, destPath);
   return true; // Newly downloaded
@@ -278,18 +296,19 @@ async function fetchPostSlides(shortcode, options = {}) {
   const slides = [];
   const url = `https://www.instagram.com/p/${shortcode}/`;
 
+  const slideHeaders = getBrowserHeaders();
+  const cookieHeader = formatCookieHeader(options.sessionCookie);
+  if (cookieHeader) {
+    slideHeaders['Cookie'] = cookieHeader;
+  }
+
   let fetchOptions = {
     method: 'GET',
-    headers: getBrowserHeaders(),
+    headers: slideHeaders,
     signal: AbortSignal.timeout(15000)
   };
 
-  if (options.proxyUrl) {
-    try {
-      const { ProxyAgent } = require('undici');
-      fetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-    } catch (e) {}
-  }
+  applyProxy(fetchOptions, options.proxyUrl);
 
   try {
     const res = await fetch(url, fetchOptions);
@@ -353,18 +372,21 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
 
   const isCache = options.isCache === true;
   const urlPrefix = isCache ? '/cache' : '/downloads';
-  const cookieHeader = options.sessionCookie || db.getSettings().sessionCookie;
+  const cookieHeader = formatCookieHeader(options.sessionCookie || db.getSettings().sessionCookie);
 
   const recordMedia = (data) => {
     if (isCache) {
-      return cacheManager.recordCachedItem(username, data);
+      return cacheManager.recordCachedItem(clean, data);
     }
-    return db.recordDownloadedMedia(username, data);
+    return db.recordDownloadedMedia(clean, data);
   };
 
   for (const hl of highlights) {
     const hlId = String(hl.id).replace(/^highlight:/, '');
-    const cleanTitle = (hl.title || 'Highlight').replace(/[/\\?%*:|"<>]/g, '_').trim();
+    const cleanTitle = (hl.title || 'Highlight')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '') || 'Highlight';
 
     // Dedicated folder for this highlight reel
     const hlDir = path.join(highlightsDir, `${cleanTitle}_${hlId}`);
@@ -385,8 +407,8 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
         headers: {
           'User-Agent': 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36',
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Cookie': cookieHeader || '',
-          'X-CSRFToken': csrf,
+          ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
+          ...(csrf ? { 'X-CSRFToken': csrf } : {}),
           'X-IG-App-ID': '936619743392459',
           'X-ASBD-ID': '359341',
           'Sec-Fetch-Dest': 'document',
@@ -396,12 +418,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
         signal: AbortSignal.timeout(15000)
       };
 
-      if (options.proxyUrl) {
-        try {
-          const { ProxyAgent } = require('undici');
-          hlFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-        } catch (e) {}
-      }
+      applyProxy(hlFetchOptions, options.proxyUrl);
 
       const res = await fetch(hlUrl, hlFetchOptions);
       if (res.ok) {
@@ -469,12 +486,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
           },
           signal: AbortSignal.timeout(12000)
         };
-        if (options.proxyUrl) {
-          try {
-            const { ProxyAgent } = require('undici');
-            mobFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-          } catch (e) {}
-        }
+        applyProxy(mobFetchOptions, options.proxyUrl);
         const mobRes = await fetch(mobileHlUrl, mobFetchOptions);
         if (mobRes.ok) {
           const mobData = await mobRes.json();
@@ -502,12 +514,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
           },
           signal: AbortSignal.timeout(12000)
         };
-        if (options.proxyUrl) {
-          try {
-            const { ProxyAgent } = require('undici');
-            webReelsOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-          } catch (e) {}
-        }
+        applyProxy(webReelsOptions, options.proxyUrl);
         const webRes = await fetch(webHlUrl, webReelsOptions);
         if (webRes.ok) {
           const webData = await webRes.json();
@@ -661,21 +668,32 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
   try {
     // 1. Fetch profile HTML page
     const profileUrl = `https://www.instagram.com/${clean}/`;
+    const profileHeaders = getBrowserHeaders();
+    const profileCookie = formatCookieHeader(options.sessionCookie);
+    if (profileCookie) {
+      profileHeaders['Cookie'] = profileCookie;
+    }
     let fetchOptions = {
       method: 'GET',
-      headers: getBrowserHeaders(),
+      headers: profileHeaders,
       redirect: 'follow',
       signal: AbortSignal.timeout(15000)
     };
 
-    if (options.proxyUrl) {
-      try {
-        const { ProxyAgent } = require('undici');
-        fetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-      } catch (e) {}
-    }
+    applyProxy(fetchOptions, options.proxyUrl);
 
-    const res = await fetch(profileUrl, fetchOptions);
+    let res = await fetch(profileUrl, fetchOptions);
+    if (profileCookie && (res.status === 401 || res.status === 403 || res.url.includes('/accounts/login') || res.url.includes('/challenge/'))) {
+      // Retry anonymously if cookie triggered a login/checkpoint challenge
+      const anonOptions = {
+        method: 'GET',
+        headers: getBrowserHeaders(),
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000)
+      };
+      applyProxy(anonOptions, options.proxyUrl);
+      res = await fetch(profileUrl, anonOptions);
+    }
     if (!res.ok) {
       throw new Error(`Profile request returned HTTP ${res.status}`);
     }
@@ -757,10 +775,11 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       for (const h of dbHighlights) {
         if (h.highlightId && !knownHlIds.has(h.highlightId)) {
           knownHlIds.add(h.highlightId);
+          const remoteCover = [h.thumbnailUrl, h.fileUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u)) || null;
           highlights.push({
             id: h.highlightId,
             title: h.highlightTitle || 'Highlight',
-            coverUrl: h.thumbnailUrl || h.fileUrl || null
+            coverUrl: remoteCover
           });
         }
       }
@@ -944,14 +963,12 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
 
   const recordMedia = (data) => {
     if (isCache) {
-      return cacheManager.recordCachedItem(username, data);
+      return cacheManager.recordCachedItem(clean, data);
     }
-    return db.recordDownloadedMedia(username, data);
+    return db.recordDownloadedMedia(clean, data);
   };
 
-  const cookieHeader = sessionCookie
-    ? (sessionCookie.includes('=') ? sessionCookie : `sessionid=${sessionCookie}`)
-    : '';
+  const cookieHeader = formatCookieHeader(sessionCookie);
 
   let items = [];
 
@@ -977,12 +994,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
       signal: AbortSignal.timeout(15000)
     };
 
-    if (options.proxyUrl) {
-      try {
-        const { ProxyAgent } = require('undici');
-        webFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-      } catch (e) {}
-    }
+    applyProxy(webFetchOptions, options.proxyUrl);
 
     const res = await fetch(webStoriesUrl, webFetchOptions);
     if (res.ok) {
@@ -1059,12 +1071,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
         signal: AbortSignal.timeout(10000)
       };
 
-      if (options.proxyUrl) {
-        try {
-          const { ProxyAgent } = require('undici');
-          mobileFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-        } catch (e) {}
-      }
+      applyProxy(mobileFetchOptions, options.proxyUrl);
 
       const res = await fetch(mobileUrl, mobileFetchOptions);
       if (res.ok) {
@@ -1093,12 +1100,7 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
         signal: AbortSignal.timeout(10000)
       };
 
-      if (options.proxyUrl) {
-        try {
-          const { ProxyAgent } = require('undici');
-          reelsFetchOptions.dispatcher = new ProxyAgent(options.proxyUrl);
-        } catch (e) {}
-      }
+      applyProxy(reelsFetchOptions, options.proxyUrl);
 
       const res = await fetch(webUrl, reelsFetchOptions);
       if (res.ok) {
@@ -1322,15 +1324,18 @@ async function fetchHighlights(username, options = {}) {
   if (discoveredHighlights.length === 0 && sessionCookie) {
     try {
       const profileUrl = `https://www.instagram.com/${clean}/`;
-      const res = await fetch(profileUrl, {
+      const formattedCookie = formatCookieHeader(sessionCookie);
+      const cookieFetchOptions = {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Cookie': sessionCookie,
+          'Cookie': formattedCookie,
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'X-IG-App-ID': '936619743392459'
         },
         signal: AbortSignal.timeout(10000)
-      });
+      };
+      applyProxy(cookieFetchOptions, options.proxyUrl);
+      const res = await fetch(profileUrl, cookieFetchOptions);
       if (res.ok) {
         const html = await res.text();
         const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
@@ -1346,10 +1351,11 @@ async function fetchHighlights(username, options = {}) {
     for (const h of dbHighlights) {
       if (h.highlightId && !knownIds.has(h.highlightId)) {
         knownIds.add(h.highlightId);
+        const remoteCover = [h.thumbnailUrl, h.fileUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u)) || null;
         discoveredHighlights.push({
           id: h.highlightId,
           title: h.highlightTitle || 'Highlight',
-          coverUrl: h.thumbnailUrl || h.fileUrl || null
+          coverUrl: remoteCover
         });
       }
     }

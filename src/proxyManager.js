@@ -11,19 +11,26 @@ class ProxyManager {
     this.failedProxies = new Map(); // proxyUrl -> cooldownUntil timestamp
   }
 
-  getProxyList() {
-    const settings = db.getSettings();
-    const raw = (settings.proxyUrl || '').trim();
-    if (!raw) return [];
+  parseProxyString(raw) {
+    const trimmed = (raw || '').trim();
+    if (!trimmed) return [];
 
-    return raw
+    return trimmed
       .split(/[\r\n,]+/)
       .map(p => p.trim())
       .filter(p => p.length > 0 && (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('socks5://') || p.startsWith('socks4://')));
   }
 
-  getNextProxy() {
-    const list = this.getProxyList();
+  getProxyList(overrideRaw = null) {
+    if (overrideRaw && typeof overrideRaw === 'string' && overrideRaw.trim()) {
+      return this.parseProxyString(overrideRaw);
+    }
+    const settings = db.getSettings();
+    return this.parseProxyString(settings.proxyUrl);
+  }
+
+  getNextProxy(overrideRaw = null) {
+    const list = this.getProxyList(overrideRaw);
     if (list.length === 0) return null;
 
     const now = Date.now();

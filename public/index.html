@@ -75,7 +75,7 @@
 
         <!-- Live Connection Status Badge -->
         <div id="connectionStatusBadge" class="flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+          <span id="connectionStatusDot" class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
           <span id="connectionStatusText">Live Connected</span>
         </div>
 
@@ -106,12 +106,12 @@
     <div id="transitionAlertBanner" class="hidden rounded-2xl bg-gradient-to-r from-emerald-600 via-teal-600 to-green-500 p-6 shadow-2xl shadow-green-500/30 border border-green-400/30 animate-bounce">
       <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
         <div class="flex items-center space-x-4">
-          <div class="w-14 h-14 rounded-full bg-white/20 flex items-center justify-center text-3xl">
+          <div id="transitionAlertIcon" class="w-14 h-14 rounded-full bg-white/20 flex items-center justify-center text-3xl">
             🚨
           </div>
           <div>
             <h2 class="text-2xl font-black tracking-tight text-white flex items-center space-x-2">
-              <span>ALERT: ACCOUNT IS NOW PUBLIC!</span>
+              <span id="transitionAlertTitle">ALERT: ACCOUNT IS NOW PUBLIC!</span>
             </h2>
             <p id="transitionAlertDetails" class="text-sm font-medium text-white/90">
               @username has just turned public!
@@ -818,6 +818,6 @@
     </div>
   </footer>
 
-  <script src="/app.js?v=3.5"></script>
+  <script src="/app.js?v=3.6"></script>
 </body>
 </html>

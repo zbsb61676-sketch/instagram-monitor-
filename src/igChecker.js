@@ -80,7 +80,7 @@ async function checkInstagramProfile(username, options = {}) {
   };
 
   // Rotating Proxy Pool
-  const activeProxy = options.proxyUrl || proxyManager.getNextProxy();
+  const activeProxy = proxyManager.getNextProxy(options.proxyUrl);
   if (activeProxy) {
     try {
       const { ProxyAgent } = require('undici');
@@ -94,6 +94,7 @@ async function checkInstagramProfile(username, options = {}) {
     const response = await fetch(url, fetchOptions);
 
     if (response.status === 429) {
+      if (activeProxy) proxyManager.markProxyFailed(activeProxy, 60);
       const mirrorResult = await checkViaMirror(clean);
       if (mirrorResult) {
         return mirrorResult;
@@ -103,6 +104,10 @@ async function checkInstagramProfile(username, options = {}) {
         profileInfo: null,
         error: 'Instagram returned HTTP 429 (Too Many Requests / IP Rate Limit)'
       };
+    }
+
+    if (activeProxy && response.ok) {
+      proxyManager.markProxyHealthy(activeProxy);
     }
 
     if (response.status === 404) {
@@ -184,6 +189,7 @@ async function checkInstagramProfile(username, options = {}) {
       error: null
     };
   } catch (err) {
+    if (activeProxy) proxyManager.markProxyFailed(activeProxy, 60);
     // Attempt anonymous mirror fallback on network timeout or fetch error
     const mirrorResult = await checkViaMirror(clean);
     if (mirrorResult) {
@@ -244,7 +250,8 @@ async function checkViaMirror(username) {
       let fullName = '';
       if (titleMatch) {
         const parts = titleMatch[1].split('•')[0].split('|')[0].replace(/Watch instagram stories.*/i, '').trim();
-        fullName = parts.replace(new RegExp(`^${clean}\\s*`, 'i'), '').trim();
+        const escapedClean = clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        fullName = parts.replace(new RegExp(`^${escapedClean}\\s*`, 'i'), '').trim();
       }
 
       return {
@@ -389,6 +396,8 @@ function extractProfileInfo(html, cleanUsername) {
               if (obj.full_name && !info.fullName) info.fullName = obj.full_name;
               if (obj.biography && !info.biography) info.biography = obj.biography;
               if (obj.profile_pic_url_hd && !info.profilePicUrl) info.profilePicUrl = obj.profile_pic_url_hd;
+              if (obj.latest_reel_media && !info.latestReelMedia) info.latestReelMedia = obj.latest_reel_media;
+              if ((obj.id || obj.pk) && !info.userId) info.userId = String(obj.id || obj.pk);
               return;
             }
             for (const k of Object.keys(obj)) inspectTarget(obj[k]);

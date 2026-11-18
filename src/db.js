@@ -127,12 +127,14 @@ class Database {
   }
 
   getTarget(idOrUsername) {
-    const clean = idOrUsername.toLowerCase().trim().replace(/^@/, '');
-    return this.data.targets.find(t => t.id === idOrUsername || t.username.toLowerCase() === clean);
+    if (!idOrUsername) return null;
+    const raw = String(idOrUsername);
+    const clean = raw.toLowerCase().trim().replace(/^@/, '');
+    return this.data.targets.find(t => t.id === raw || t.username.toLowerCase() === clean);
   }
 
   addTarget(username, intervalSec = null) {
-    const cleanUsername = username.toLowerCase().trim().replace(/^@/, '');
+    const cleanUsername = (username || '').toLowerCase().trim().replace(/^@/, '');
     if (!cleanUsername) throw new Error('Username cannot be empty');
 
     const existing = this.getTarget(cleanUsername);
@@ -140,9 +142,10 @@ class Database {
       throw new Error(`Target @${cleanUsername} is already being tracked`);
     }
 
+    const parsedInterval = intervalSec !== null && intervalSec !== undefined ? parseInt(intervalSec, 10) : NaN;
     const interval = Math.max(
       config.MIN_CHECK_INTERVAL_SEC,
-      intervalSec ? parseInt(intervalSec, 10) : this.data.settings.defaultIntervalSec
+      Number.isFinite(parsedInterval) ? parsedInterval : (this.data.settings.defaultIntervalSec || 3)
     );
 
     const newTarget = {
@@ -230,7 +233,7 @@ class Database {
       'info',
       target.username
     );
-    return target;
+    return this.enrichTarget(target);
   }
 
   // --- Logs ---

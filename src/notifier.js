@@ -12,6 +12,14 @@ const path = require('path');
 const config = require('./config');
 const telegramClient = require('./telegramClient');
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /**
  * Send an alert message to a Telegram chat via Bot API
  */
@@ -21,7 +29,7 @@ async function sendTelegramAlert({ username, previousStatus, currentStatus, prof
   }
 
   const profileUrl = `https://www.instagram.com/${username}/`;
-  const nameDisplay = profileInfo?.fullName ? ` (${profileInfo.fullName})` : '';
+  const nameDisplay = profileInfo?.fullName ? ` (${escapeHtml(profileInfo.fullName)})` : '';
   const verifiedBadge = profileInfo?.isVerified ? ' ✅' : '';
   const isNowPrivate = currentStatus === 'private';
 
@@ -301,11 +309,12 @@ async function sendTelegramMediaPhotos({ username, items, token, chatId }) {
   try {
     if (validPhotos.length === 1) {
       const photo = validPhotos[0];
-      const captionText = `📸 <b>@${username}</b> latest post:\n\n${photo.caption ? photo.caption.slice(0, 300) : 'New public post'}\n\n🔗 <a href="https://www.instagram.com/${username}/">View on Instagram</a>`;
+      const safeCaption = photo.caption ? escapeHtml(photo.caption.slice(0, 300)) : 'New public post';
+      const captionText = `📸 <b>@${escapeHtml(username)}</b> latest post:\n\n${safeCaption}\n\n🔗 <a href="https://www.instagram.com/${encodeURIComponent(username)}/">View on Instagram</a>`;
       const res = await telegramClient.sendPhoto(token, chatId, photo.fullPath, captionText);
       return { success: res.ok, data: res.data };
     } else {
-      const albumCaption = `📸 <b>@${username}</b> latest media album (${validPhotos.length} photos)\n🔗 <a href="https://www.instagram.com/${username}/">instagram.com/${username}</a>`;
+      const albumCaption = `📸 <b>@${escapeHtml(username)}</b> latest media album (${validPhotos.length} photos)\n🔗 <a href="https://www.instagram.com/${encodeURIComponent(username)}/">instagram.com/${escapeHtml(username)}</a>`;
       const res = await telegramClient.sendMediaGroup(token, chatId, validPhotos, albumCaption);
       return { success: res.ok, data: res.data };
     }
@@ -450,11 +459,11 @@ async function dispatchActivityAlert(type, data, settings, db, broadcastFn) {
   } else if (type === 'BIO_CHANGED') {
     title = `📝 BIO UPDATED`;
     telegramMsg = [
-      `📝 <b>BIO UPDATED for @${username}</b>`,
+      `📝 <b>BIO UPDATED for @${escapeHtml(username)}</b>`,
       ``,
-      `Old Bio:\n<i>${oldBio || '(none)'}</i>`,
+      `Old Bio:\n<i>${escapeHtml(oldBio) || '(none)'}</i>`,
       ``,
-      `New Bio:\n<b>${newBio || '(none)'}</b>`,
+      `New Bio:\n<b>${escapeHtml(newBio) || '(none)'}</b>`,
       ``,
       `🔗 <a href="${targetUrl}">Open Profile</a>`
     ].join('\n');

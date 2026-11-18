@@ -34,6 +34,29 @@ function cleanHandle(username) {
   return (username || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-zA-Z0-9._]/g, '');
 }
 
+// Mask sensitive secrets before sending settings to browser clients (REST or WebSocket)
+function maskSettings(settings) {
+  const rawCookie = settings.sessionCookie || '';
+  const sessionMatch = rawCookie.match(/sessionid=([^;]+)/);
+  const maskedCookie = sessionMatch
+    ? `sessionid=${sessionMatch[1].slice(0, 8)}...***`
+    : (rawCookie ? `${rawCookie.slice(0, 10)}...***` : '');
+
+  const rawToken = settings.telegramToken || '';
+  const maskedToken = rawToken
+    ? `${rawToken.slice(0, 6)}...${rawToken.slice(-4)}`
+    : '';
+
+  return {
+    ...settings,
+    sessionCookie: maskedCookie,
+    telegramToken: maskedToken,
+    telegramTokenMasked: maskedToken,
+    hasSessionCookie: Boolean(rawCookie),
+    hasTelegramToken: Boolean(rawToken)
+  };
+}
+
 // Active client tracking for session-based temporary cache lifecycle
 const activeClientSessions = new Map(); // ws -> Set<username>
 const userCleanupTimers = new Map(); // username -> NodeJS.Timeout
@@ -119,7 +142,7 @@ wss.on('connection', (ws) => {
     type: 'INIT',
     data: {
       targets: db.getEnrichedTargets(),
-      settings: db.getSettings(),
+      settings: maskSettings(db.getSettings()),
       logs: db.getLogs(50),
       serverTime: new Date().toISOString()
     }
@@ -217,12 +240,13 @@ app.get('/api/session/status', async (req, res) => {
 
   const userIdMatch = cookieStr.match(/ds_user_id=([^;]+)/);
   const userId = userIdMatch ? userIdMatch[1] : null;
+  const formattedCookie = cookieStr.includes('=') ? cookieStr : `sessionid=${cookieStr}`;
 
   try {
     const checkRes = await fetch('https://www.instagram.com/accounts/edit/', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        'Cookie': cookieStr,
+        'Cookie': formattedCookie,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
       redirect: 'manual',
@@ -283,13 +307,16 @@ app.put('/api/targets/:id', (req, res) => {
 
     const updates = {};
     if (intervalSec !== undefined) {
-      updates.intervalSec = Math.max(config.MIN_CHECK_INTERVAL_SEC, parseInt(intervalSec, 10));
+      const parsed = parseInt(intervalSec, 10);
+      if (Number.isFinite(parsed)) {
+        updates.intervalSec = Math.max(config.MIN_CHECK_INTERVAL_SEC, parsed);
+      }
     }
     if (isMonitoring !== undefined) {
       updates.isMonitoring = Boolean(isMonitoring);
     }
 
-    const updated = db.updateTarget(req.params.id, updates);
+    const updated = db.updateTarget(target.id, updates);
     monitor.onTargetUpdated(updated);
     broadcast({ type: 'TARGET_UPDATED', data: updated });
     res.json(updated);
@@ -304,7 +331,7 @@ app.post('/api/targets/:id/toggle', (req, res) => {
     return res.status(404).json({ error: 'Target not found' });
   }
 
-  const updated = db.toggleTargetMonitoring(req.params.id);
+  const updated = db.toggleTargetMonitoring(target.id);
   monitor.onTargetUpdated(updated);
   broadcast({ type: 'TARGET_UPDATED', data: updated });
   res.json(updated);
@@ -312,7 +339,11 @@ app.post('/api/targets/:id/toggle', (req, res) => {
 
 app.post('/api/targets/:id/check', async (req, res) => {
   try {
-    const updated = await monitor.checkNow(req.params.id);
+    const target = db.getTarget(req.params.id);
+    if (!target) {
+      return res.status(404).json({ error: 'Target not found' });
+    }
+    const updated = await monitor.checkNow(target.id);
     res.json(updated);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -367,16 +398,15 @@ app.post('/api/targets/:id/simulate-transition', async (req, res) => {
 });
 
 app.delete('/api/targets/:id', (req, res) => {
-  const id = req.params.id;
-  const target = db.getTarget(id);
+  const target = db.getTarget(req.params.id);
   if (!target) {
     return res.status(404).json({ error: 'Target not found' });
   }
 
-  monitor.onTargetDeleted(id);
-  db.deleteTarget(id);
-  broadcast({ type: 'TARGET_DELETED', data: { id } });
-  res.json({ success: true, id });
+  monitor.onTargetDeleted(target.id);
+  db.deleteTarget(target.id);
+  broadcast({ type: 'TARGET_DELETED', data: { id: target.id } });
+  res.json({ success: true, id: target.id });
 });
 
 // Download Content Endpoints
@@ -672,7 +702,7 @@ app.get('/api/backup-viewer/:username', async (req, res) => {
     let html = await upstreamRes.text();
 
     // Inject <base href="https://anonyig.com/"> so all relative assets, CSS, and JS load properly
-    html = html.replace('<head>', '<head><base href="https://anonyig.com/">');
+    html = html.replace(/<head[^>]*>/i, '$&<base href="https://anonyig.com/">');
 
     // Inject fallback banner in case browser blocks cross-origin requests
     const directUrl = `https://anonyig.com/en2/?url=${encodeURIComponent(clean)}`;
@@ -688,7 +718,6 @@ app.get('/api/backup-viewer/:username', async (req, res) => {
     res.removeHeader('X-Frame-Options');
     res.removeHeader('Content-Security-Policy');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
 
     res.send(html);
   } catch (err) {
@@ -698,21 +727,7 @@ app.get('/api/backup-viewer/:username', async (req, res) => {
 
 // Settings
 app.get('/api/settings', (req, res) => {
-  const settings = db.getSettings();
-  const rawCookie = settings.sessionCookie || '';
-  const sessionMatch = rawCookie.match(/sessionid=([^;]+)/);
-  const maskedCookie = sessionMatch
-    ? `sessionid=${sessionMatch[1].slice(0, 8)}...***`
-    : (rawCookie ? `${rawCookie.slice(0, 10)}...***` : '');
-
-  // Mask sensitive token & cookie for security
-  const masked = {
-    ...settings,
-    sessionCookie: maskedCookie,
-    telegramTokenMasked: settings.telegramToken ? `${settings.telegramToken.slice(0, 6)}...${settings.telegramToken.slice(-4)}` : '',
-    hasSessionCookie: Boolean(rawCookie)
-  };
-  res.json(masked);
+  res.json(maskSettings(db.getSettings()));
 });
 
 app.put('/api/settings', (req, res) => {
@@ -747,8 +762,9 @@ app.put('/api/settings', (req, res) => {
     }
     db.addLog('System settings updated', 'info');
     telegramBot.restart();
-    broadcast({ type: 'SETTINGS_UPDATED', data: updated });
-    res.json(updated);
+    const masked = maskSettings(updated);
+    broadcast({ type: 'SETTINGS_UPDATED', data: masked });
+    res.json(masked);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -757,7 +773,8 @@ app.put('/api/settings', (req, res) => {
 // Test Notification Endpoints
 app.post('/api/settings/test-telegram', async (req, res) => {
   const currentSettings = db.getSettings();
-  const token = req.body.token || currentSettings.telegramToken;
+  const incomingToken = typeof req.body.token === 'string' ? req.body.token.trim() : '';
+  const token = (incomingToken && !incomingToken.includes('...')) ? incomingToken : currentSettings.telegramToken;
   const chatId = req.body.chatId || currentSettings.telegramChatId;
 
   const result = await testTelegram(token, chatId);

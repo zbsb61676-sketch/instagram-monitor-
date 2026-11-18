@@ -21,6 +21,7 @@ const anonyigProvider = require('./anonyigProvider');
 class TelegramBotService {
   constructor() {
     this.isRunning = false;
+    this.pollGeneration = 0;
     this.pollingAbort = null;
     this.lastUpdateId = 0;
     this.broadcastFn = null;
@@ -52,6 +53,7 @@ class TelegramBotService {
 
     if (this.isRunning) return;
     this.isRunning = true;
+    const generation = ++this.pollGeneration;
     console.log('[TelegramBot] Starting interactive Telegram bot long-polling engine...');
 
     // Cold-start protection: acknowledge and skip stale commands sent during downtime
@@ -65,11 +67,14 @@ class TelegramBotService {
       } catch (e) {}
     }
 
-    this.pollLoop();
+    if (this.isRunning && this.pollGeneration === generation) {
+      this.pollLoop(generation);
+    }
   }
 
   stop() {
     this.isRunning = false;
+    this.pollGeneration++;
     if (this.pollingAbort) {
       try {
         this.pollingAbort.abort();
@@ -84,8 +89,8 @@ class TelegramBotService {
     setTimeout(() => this.start(), 1000);
   }
 
-  async pollLoop() {
-    while (this.isRunning) {
+  async pollLoop(generation) {
+    while (this.isRunning && this.pollGeneration === generation) {
       const settings = db.getSettings();
       const token = settings.telegramToken;
       if (!token) {
@@ -161,9 +166,9 @@ class TelegramBotService {
       return;
     }
 
-    // Command parser
+    // Command parser (strip @BotUsername suffix in group chats / menus)
     const parts = text.split(/\s+/);
-    const cmd = parts[0].toLowerCase();
+    const cmd = parts[0].toLowerCase().replace(/@.*$/, '');
     const arg1 = parts[1] ? parts[1].replace(/^@/, '') : '';
     const arg2 = parts[2];
 
@@ -214,8 +219,8 @@ class TelegramBotService {
       if (!arg1) {
         return this.sendMessage(token, chatId, '⚠️ Please provide a username:\nUsage: <code>/highlights instagram</code>');
       }
-      const arg2 = parts[2] ? parts[2].trim().toLowerCase() : '';
-      const mode = (arg2 === 'all' || arg1.toLowerCase() === 'all') ? 'ALL' : (parts.slice(2).join(' ').trim() || null);
+      const subArg = parts[2] ? parts[2].trim().toLowerCase() : '';
+      const mode = subArg === 'all' ? 'ALL' : (parts.slice(2).join(' ').trim() || null);
       return this.handleHighlightsCommand(token, chatId, arg1, settings, mode);
     }
 
@@ -380,23 +385,20 @@ class TelegramBotService {
     }
 
     if (data === 'keepalive:ping') {
-      await telegramClient.answerCallbackQuery(token, cbId, 'Sending Keep-Alive Heartbeat...');
       const res = await keepAlive.pingNow();
       if (res.ok) {
         await this.sendMessage(token, chatId, `✅ <b>Keep-Alive Heartbeat Succeeded!</b>\n• Latency: <b>${res.latency}ms</b>\n• Status: <b>HTTP ${res.status}</b>\n• Render 15m sleep timer reset successfully.`);
       } else {
-        await this.sendMessage(token, chatId, `⚠️ <b>Keep-Alive Heartbeat Failed:</b> ${res.error || `HTTP ${res.status}`}\nMake sure your Render URL is accessible.`);
+        await this.sendMessage(token, chatId, `⚠️ <b>Keep-Alive Heartbeat Failed:</b> ${escapeHtml(res.error || `HTTP ${res.status}`)}\nMake sure your Render URL is accessible.`);
       }
       return;
     }
 
     if (data === 'keepalive:status') {
-      await telegramClient.answerCallbackQuery(token, cbId);
       return this.handleKeepAliveCommand(token, chatId);
     }
 
     if (data === 'server:stats') {
-      await telegramClient.answerCallbackQuery(token, cbId);
       return this.sendStatsMessage(token, chatId);
     }
   }
@@ -487,7 +489,7 @@ class TelegramBotService {
       }
 
       if (result.status === 'error') {
-        return this.sendMessage(token, chatId, `⚠️ <b>Error checking @${clean}:</b> ${result.error}`);
+        return this.sendMessage(token, chatId, `⚠️ <b>Error checking @${clean}:</b> ${escapeHtml(result.error)}`);
       }
 
       const isPrivate = result.status === 'private';
@@ -839,8 +841,14 @@ class TelegramBotService {
           const count = byTitle[t].length;
           totalCount += count;
           summaryLines.push(`• <b>${escapeHtml(t)}</b> — <code>${count} items</code>`);
+          // Keep callback_data strictly within Telegram's 64-byte limit
+          const hlId = byTitle[t][0]?.highlightId;
+          const idCandidate = hlId ? `hlreel:${clean}:id:${hlId}` : `hlreel:${clean}:idx:${i}`;
+          const safeCallback = Buffer.byteLength(idCandidate, 'utf8') <= 64
+            ? idCandidate
+            : `hlreel:${clean}:idx:${i}`;
           reelRows.push([
-            { text: `📁 ${t} (${count} items)`, callback_data: `hlreel:${clean}:${encodeURIComponent(t)}` }
+            { text: `📁 ${t} (${count} items)`, callback_data: safeCallback }
           ]);
         }
 
@@ -870,8 +878,19 @@ class TelegramBotService {
       // Determine which reels to deliver
       let reelsToDeliver = {};
       if (selectedReel && selectedReel !== 'ALL') {
-        const matchingKey = Object.keys(byTitle).find(k => k.toLowerCase() === selectedReel.toLowerCase()) || selectedReel;
-        if (byTitle[matchingKey]) {
+        let matchingKey = null;
+        if (selectedReel.startsWith('id:')) {
+          const targetHlId = selectedReel.slice(3);
+          matchingKey = Object.keys(byTitle).find(k => byTitle[k].some(it => String(it.highlightId) === targetHlId));
+        } else if (selectedReel.startsWith('idx:')) {
+          const idx = parseInt(selectedReel.slice(4), 10);
+          if (Number.isInteger(idx) && idx >= 0 && idx < reelTitles.length) {
+            matchingKey = reelTitles[idx];
+          }
+        } else {
+          matchingKey = Object.keys(byTitle).find(k => k.toLowerCase() === selectedReel.toLowerCase()) || selectedReel;
+        }
+        if (matchingKey && byTitle[matchingKey]) {
           reelsToDeliver[matchingKey] = byTitle[matchingKey];
         } else {
           reelsToDeliver = byTitle;
@@ -963,7 +982,7 @@ class TelegramBotService {
 
     try {
       let allMedia = db.getDownloadedMedia(clean);
-      let reels = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story')));
+      let reels = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story') && !m.type?.includes('highlight')));
 
       const postsDir = path.join(config.DOWNLOADS_DIR, clean, 'posts');
       if (fs.existsSync(postsDir)) {
@@ -988,7 +1007,7 @@ class TelegramBotService {
           proxyUrl: settings.proxyUrl
         });
         allMedia = db.getDownloadedMedia(clean);
-        reels = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story')));
+        reels = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story') && !m.type?.includes('highlight')));
       }
 
       const validReels = [];
@@ -1149,10 +1168,11 @@ class TelegramBotService {
           reply_markup: { inline_keyboard: buttons }
         });
       } else {
-        await this.sendMessage(token, chatId, `📦 <b>Archive Ready (${sizeStr})</b>\n\nNotice: This archive exceeds Telegram's 50MB file size limit for bots.\nYou can download it directly from your web dashboard server at:\n<code>http://localhost:3000/api/download-zip/${clean}</code>`);
+        const baseUrl = keepAlive.getPublicUrl() || `http://localhost:${config.PORT}`;
+        await this.sendMessage(token, chatId, `📦 <b>Archive Ready (${sizeStr})</b>\n\nNotice: This archive exceeds Telegram's 50MB file size limit for bots.\nYou can download it directly from your web dashboard server at:\n<code>${baseUrl}/api/download-zip/${clean}</code>`);
       }
     } catch (err) {
-      await this.sendMessage(token, chatId, `❌ ZIP generation error: ${err.message}`);
+      await this.sendMessage(token, chatId, `❌ ZIP generation error: ${escapeHtml(err.message)}`);
     } finally {
       if (zipPath && fs.existsSync(zipPath)) {
         try {
@@ -1170,9 +1190,9 @@ class TelegramBotService {
     const userDir = path.join(config.DOWNLOADS_DIR, clean);
 
     let storiesCount = allMedia.filter(m => m.type?.includes('story')).length;
-    let reelsCount = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story'))).length;
+    let reelsCount = allMedia.filter(m => m.type === 'video_post' || m.type === 'reel' || (m.fileName && m.fileName.endsWith('.mp4') && !m.type?.includes('story') && !m.type?.includes('highlight'))).length;
     let postsCount = allMedia.filter(m => m.type === 'carousel_slide' || m.type === 'photo_post').length;
-    let highlightsCount = allMedia.filter(m => m.type === 'highlight').length;
+    let highlightsCount = allMedia.filter(m => m.type?.includes('highlight')).length;
 
     let totalDiskBytes = 0;
     if (fs.existsSync(userDir)) {
@@ -1346,7 +1366,7 @@ class TelegramBotService {
       if (this.monitorService) {
         this.monitorService.onTargetAdded(target);
       }
-      this.broadcast({ type: 'TARGET_ADDED', data: target });
+      this.broadcast({ type: 'TARGET_ADDED', data: db.enrichTarget(target) });
 
       await this.sendMessage(
         token,
@@ -1354,7 +1374,7 @@ class TelegramBotService {
         `✅ <b>Target Added:</b> Now monitoring <b>@${clean}</b> in real time (every ${interval}s).\nYou will receive instant alerts if privacy flips between Public & Private.`
       );
     } catch (err) {
-      await this.sendMessage(token, chatId, `❌ Failed adding target: ${err.message}`);
+      await this.sendMessage(token, chatId, `❌ Failed adding target: ${escapeHtml(err.message)}`);
     }
   }
 
@@ -1542,9 +1562,13 @@ class TelegramBotService {
   async sendPhoto(token, chatId, photoUrl, caption = '', options = {}) {
     try {
       const res = await telegramClient.sendPhoto(token, chatId, photoUrl, caption, options);
-      return res.data;
+      if (res && res.ok) {
+        return res.data;
+      }
+      console.warn(`[TelegramBot] sendPhoto returned not ok (${res?.data?.description || res?.statusCode}), falling back to text message...`);
+      return this.sendMessage(token, chatId, caption, options);
     } catch (e) {
-      return this.sendMessage(token, chatId, caption);
+      return this.sendMessage(token, chatId, caption, options);
     }
   }
 

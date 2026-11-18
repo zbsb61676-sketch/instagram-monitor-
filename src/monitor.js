@@ -103,13 +103,13 @@ class MonitorService {
         consecutiveErrors = 0;
       }
 
-      // Target privacy status is strictly PUBLIC or PRIVATE.
-      // Transient network glitches or rate limits NEVER corrupt a target's privacy state!
+      // Target privacy status preserves last known PUBLIC/PRIVATE state across transient errors/rate limits.
       let effectiveStatus = target.status;
-      if (newStatus === 'public' || newStatus === 'private') {
+      if (newStatus === 'public' || newStatus === 'private' || newStatus === 'not_found') {
         effectiveStatus = newStatus;
       } else {
-        effectiveStatus = target.lastKnownPrivacyState || (target.status !== 'error' && target.status !== 'rate_limited' ? target.status : null) || 'public';
+        effectiveStatus = target.lastKnownPrivacyState ||
+          (target.status === 'public' || target.status === 'private' ? target.status : 'pending');
       }
 
       const updates = {
@@ -121,6 +121,8 @@ class MonitorService {
 
       if (result.error) {
         updates.lastError = result.error;
+      } else {
+        updates.lastError = null;
       }
 
       if (result.profileInfo) {
@@ -128,7 +130,9 @@ class MonitorService {
           fullName: result.profileInfo.fullName || target.profileInfo?.fullName || '',
           isVerified: result.profileInfo.isVerified ?? target.profileInfo?.isVerified ?? false,
           biography: result.profileInfo.biography || target.profileInfo?.biography || '',
-          profilePicUrl: result.profileInfo.profilePicUrl || target.profileInfo?.profilePicUrl || ''
+          profilePicUrl: result.profileInfo.profilePicUrl || target.profileInfo?.profilePicUrl || '',
+          userId: result.profileInfo.userId || target.profileInfo?.userId || null,
+          latestReelMedia: result.profileInfo.latestReelMedia || target.profileInfo?.latestReelMedia || null
         };
       }
 
@@ -259,12 +263,21 @@ class MonitorService {
 
     } catch (err) {
       console.error(`[Monitor] Error checking @${target.username}:`, err.message);
-      db.updateTarget(target.id, {
+      const fallbackStatus = target.lastKnownPrivacyState ||
+        (target.status === 'public' || target.status === 'private' ? target.status : 'pending');
+      const erroredTarget = db.updateTarget(target.id, {
         lastCheckedAt: new Date().toISOString(),
         consecutiveErrors: (target.consecutiveErrors || 0) + 1,
-        status: target.lastKnownPrivacyState || 'public',
+        status: fallbackStatus,
+        connectionStatus: 'error',
         lastError: err.message
       });
+      if (erroredTarget) {
+        this.broadcast({
+          type: 'TARGET_UPDATED',
+          data: erroredTarget
+        });
+      }
     } finally {
       this.activeLocks.delete(targetId);
 
@@ -274,12 +287,12 @@ class MonitorService {
         let intervalMs = Math.max(1000, (latestTarget.intervalSec || 3) * 1000);
 
         // Adaptive Backoff on Instagram Rate-Limits to prevent prolonged IP bans
-        if (latestTarget.status === 'rate_limited') {
+        if (latestTarget.connectionStatus === 'rate_limited' || latestTarget.status === 'rate_limited') {
           const errCount = latestTarget.consecutiveErrors || 1;
           // Progressive backoff: 30s -> 60s -> 120s max
           const backoffSec = Math.min(120, 30 * Math.pow(2, Math.min(errCount - 1, 2)));
           intervalMs = backoffSec * 1000;
-        } else if (latestTarget.status === 'error' && (latestTarget.consecutiveErrors || 0) >= 3) {
+        } else if ((latestTarget.connectionStatus === 'error' || latestTarget.status === 'error') && (latestTarget.consecutiveErrors || 0) >= 3) {
           intervalMs = Math.max(intervalMs, 10000); // 10s cooldown on persistent network errors
         }
 
@@ -298,15 +311,23 @@ class MonitorService {
     if (!target) throw new Error('Target not found');
 
     // Clear active lock to ensure manual user check runs immediately
-    this.activeLocks.delete(targetId);
-    await this.executeCheck(targetId, { force: true });
-    return db.getTarget(targetId);
+    this.activeLocks.delete(target.id);
+    await this.executeCheck(target.id, { force: true });
+    return db.getEnrichedTarget(target.id);
+  }
+
+  /**
+   * Called when a new target is added
+   */
+  onTargetAdded(target) {
+    this.onTargetUpdated(target);
   }
 
   /**
    * Called when a target is added or updated
    */
   onTargetUpdated(target) {
+    if (!target) return;
     if (target.isMonitoring) {
       this.scheduleTarget(target, 0); // Check immediately
     } else {

@@ -85,6 +85,7 @@ const sounds = new SoundEffects();
 
 // DOM Elements
 const connectionBadge = document.getElementById('connectionStatusBadge');
+const connectionDot = document.getElementById('connectionStatusDot');
 const connectionText = document.getElementById('connectionStatusText');
 const soundToggleBtn = document.getElementById('soundToggleBtn');
 const soundIcon = document.getElementById('soundIcon');
@@ -160,9 +161,13 @@ const testDiscordBtn = document.getElementById('testDiscordBtn');
 const discordFeedback = document.getElementById('discordFeedback');
 
 const transitionAlertBanner = document.getElementById('transitionAlertBanner');
+const transitionAlertIcon = document.getElementById('transitionAlertIcon');
+const transitionAlertTitle = document.getElementById('transitionAlertTitle');
 const transitionAlertDetails = document.getElementById('transitionAlertDetails');
 const transitionAlertLink = document.getElementById('transitionAlertLink');
 const dismissAlertBtn = document.getElementById('dismissAlertBtn');
+
+let liveStreamTimer = null;
 
 // --- WebSocket Connection ---
 let socket = null;
@@ -207,9 +212,11 @@ function connectWebSocket() {
 function updateConnectionBadge(connected) {
   if (connected) {
     connectionBadge.className = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+    if (connectionDot) connectionDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-ping';
     connectionText.textContent = 'Live Connected';
   } else {
     connectionBadge.className = 'flex items-center space-x-2 px-3 py-1.5 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20';
+    if (connectionDot) connectionDot.className = 'w-2 h-2 rounded-full bg-amber-400 animate-pulse';
     connectionText.textContent = 'Reconnecting...';
   }
 }
@@ -224,7 +231,9 @@ function handleSocketMessage(msg) {
       break;
 
     case 'TARGET_ADDED':
-      state.targets.push(msg.data);
+      if (!state.targets.some(t => t.id === msg.data.id)) {
+        state.targets.push(msg.data);
+      }
       renderTargets();
       renderStats();
       showToast(`Added @${msg.data.username} to monitoring`, 'success');
@@ -265,7 +274,7 @@ function handleSocketMessage(msg) {
 
     case 'SETTINGS_UPDATED':
       state.settings = { ...state.settings, ...msg.data };
-      showToast('Settings saved successfully', 'success');
+      updateSessionIndicator();
       break;
 
     case 'MEDIA_DOWNLOADED':
@@ -358,14 +367,19 @@ function handleSocketMessage(msg) {
 function handleTransitionAlert(alertData) {
   sounds.playAlert();
 
-  // Show prominent alert banner
-  transitionAlertBanner.classList.remove('hidden');
+  // Show prominent alert banner with accurate Private vs Public styling
   const isPrivate = alertData.currentStatus === 'private';
 
   if (isPrivate) {
+    transitionAlertBanner.className = 'rounded-2xl bg-gradient-to-r from-amber-600 via-orange-600 to-rose-600 p-6 shadow-2xl shadow-amber-500/30 border border-amber-400/30 animate-bounce';
+    if (transitionAlertIcon) transitionAlertIcon.textContent = '🔒';
+    if (transitionAlertTitle) transitionAlertTitle.textContent = 'ALERT: ACCOUNT IS NOW PRIVATE!';
     transitionAlertDetails.textContent = `@${alertData.username} changed from PUBLIC to 🔒 PRIVATE (Account Locked)!`;
     showToast(`🔒 ALERT: @${alertData.username} is now PRIVATE!`, 'alert');
   } else {
+    transitionAlertBanner.className = 'rounded-2xl bg-gradient-to-r from-emerald-600 via-teal-600 to-green-500 p-6 shadow-2xl shadow-green-500/30 border border-green-400/30 animate-bounce';
+    if (transitionAlertIcon) transitionAlertIcon.textContent = '🚨';
+    if (transitionAlertTitle) transitionAlertTitle.textContent = 'ALERT: ACCOUNT IS NOW PUBLIC!';
     transitionAlertDetails.textContent = `@${alertData.username} changed from ${alertData.previousStatus?.toUpperCase() || 'PRIVATE'} to 🟢 PUBLIC!`;
     showToast(`🚨 ALERT: @${alertData.username} is now PUBLIC!`, 'alert');
   }
@@ -405,7 +419,7 @@ function renderAll() {
 
 function updateSessionIndicator() {
   if (!sessionDot || !sessionStatusText) return;
-  if (state.settings?.sessionCookie) {
+  if (state.settings?.hasSessionCookie || state.settings?.sessionCookie) {
     sessionDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
     sessionStatusText.textContent = 'Session Cookie Active';
     sessionStatusText.className = 'text-emerald-400 font-bold';
@@ -521,7 +535,7 @@ function createTargetCard(target) {
           <div class="grid grid-cols-4 gap-2 rounded-xl bg-gray-950 p-2 border border-gray-800">
             ${target.recentMedia.map(m => `
               <div onclick="openGallery('${target.id}', '${escapeHtml(target.username)}')" class="aspect-square rounded-lg overflow-hidden bg-gray-900 border border-gray-800 hover:border-pink-500/50 transition cursor-pointer relative group">
-                <img src="${escapeHtml(m.fileUrl)}" alt="preview" class="w-full h-full object-cover group-hover:scale-105 transition" onerror="this.style.display='none'" />
+                <img src="${escapeHtml(m.thumbnailUrl || m.fileUrl)}" alt="preview" class="w-full h-full object-cover group-hover:scale-105 transition" onerror="this.style.display='none'" />
                 ${m.type?.includes('video') ? '<span class="absolute bottom-1 right-1 text-[8px] bg-black/80 text-white px-1 py-0.5 rounded"><i class="fa-solid fa-play"></i></span>' : ''}
               </div>
             `).join('')}
@@ -529,7 +543,7 @@ function createTargetCard(target) {
         </div>
       ` : ''}
 
-      ${target.consecutiveErrors > 0 && target.status === 'rate_limited' ? `
+      ${target.consecutiveErrors > 0 && (target.status === 'rate_limited' || target.connectionStatus === 'rate_limited') ? `
         <div class="mt-2 text-[11px] text-amber-400/90 bg-amber-500/10 p-2 rounded-lg border border-amber-500/20">
           ⚠️ Rate limited. Add a proxy in Settings to continue 1s checks.
         </div>
@@ -833,8 +847,9 @@ function updateSelectionUI() {
     downloadSelectedZipBtn.disabled = selectedCount === 0;
   }
 
-  if (downloadSelectedText) {
-    downloadSelectedText.textContent = `Download Selected (${selectedCount}) as .ZIP`;
+  const selectedTextEl = document.getElementById('downloadSelectedText');
+  if (selectedTextEl) {
+    selectedTextEl.textContent = `Download Selected (${selectedCount}) as .ZIP`;
   }
 
   if (selectAllCheckbox) {
@@ -1058,10 +1073,15 @@ if (liveDownloadForm) {
         liveStatusText.textContent = `⚡ Ready: ${total} items cached for @${username}. Select items below to download:`;
         if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
         
-        // Smooth stream animation into grid
-        const streamTimer = setInterval(() => {
+        // Smooth stream animation into grid (cancel any previous stream timer)
+        if (liveStreamTimer) {
+          clearInterval(liveStreamTimer);
+          liveStreamTimer = null;
+        }
+        liveStreamTimer = setInterval(() => {
           if (idx >= total) {
-            clearInterval(streamTimer);
+            clearInterval(liveStreamTimer);
+            liveStreamTimer = null;
             updateSelectionUI();
             return;
           }
@@ -1848,8 +1868,15 @@ function renderLightboxItem() {
   }
 
   if (lightboxPostCode) {
-    if (item.code) {
+    const isDirectPost = item.code && !isStory && !isHighlight && item.type !== 'profile_pic' && item.code !== 'avatar';
+    if (isDirectPost) {
       lightboxPostCode.innerHTML = `<a href="https://www.instagram.com/p/${escapeHtml(item.code)}/" target="_blank" class="text-pink-400 hover:underline flex items-center space-x-1"><i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i><span>instagram.com/p/${escapeHtml(item.code)}</span></a>`;
+    } else if (currentGalleryTarget?.username) {
+      const targetUser = escapeHtml(currentGalleryTarget.username);
+      const profileHref = isStory
+        ? `https://www.instagram.com/stories/${encodeURIComponent(currentGalleryTarget.username)}/`
+        : `https://www.instagram.com/${encodeURIComponent(currentGalleryTarget.username)}/`;
+      lightboxPostCode.innerHTML = `<a href="${profileHref}" target="_blank" class="text-pink-400 hover:underline flex items-center space-x-1"><i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i><span>@${targetUser}</span></a>`;
     } else {
       lightboxPostCode.innerHTML = '';
     }

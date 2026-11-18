@@ -134,8 +134,9 @@ function buildMultipart(fields, files) {
 
   for (const [key, val] of Object.entries(fields)) {
     if (val === undefined || val === null) continue;
+    const serialized = typeof val === 'object' ? JSON.stringify(val) : String(val);
     parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${val}\r\n`
+      `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${serialized}\r\n`
     ));
   }
 
