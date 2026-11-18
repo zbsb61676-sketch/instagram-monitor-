@@ -16,6 +16,7 @@ const {
   downloadTargetContent,
   inspectProfileMedia,
   inspectHighlightReel,
+  resolveItemForDownload,
   downloadItemsToTempDir,
   downloadFile
 } = require('./downloader');
@@ -1161,7 +1162,7 @@ app.post('/api/temp/highlight', heavyEndpointLimiter, async (req, res) => {
   }
 });
 
-// Phase 2a: On-demand single-file temporary download (auto-deleted immediately after transfer)
+// Phase 2a: On-demand single-item temporary download (resolves real full-HD MP4 / original JPEG / carousel slides & auto-deletes)
 app.get('/api/temp/download/:username/:itemId', async (req, res) => {
   const clean = cleanHandle(req.params.username);
   const itemId = req.params.itemId;
@@ -1173,15 +1174,64 @@ app.get('/api/temp/download/:username/:itemId', async (req, res) => {
   }
 
   const jobDir = path.join(config.CACHE_DIR, '.tmp_dl', `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
-  const safeName = (item.fileName || `${itemId}.${item.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
-  const destPath = path.join(jobDir, safeName);
   const cleanup = () => {
     try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch (e) {}
   };
 
   try {
     const settings = db.getSettings();
-    await downloadFile(item.mediaUrl, destPath, {
+    const resolvedFiles = await resolveItemForDownload(item, {
+      proxyUrl: settings.proxyUrl,
+      sessionCookie: settings.sessionCookie
+    });
+
+    if (resolvedFiles.length === 0) {
+      cleanup();
+      return res.status(502).send('Could not resolve downloadable media URL');
+    }
+
+    // If this is a multi-slide carousel post, download all slides concurrently and stream as a ZIP
+    if (resolvedFiles.length > 1) {
+      const downloaded = await downloadItemsToTempDir(
+        resolvedFiles.map((f, idx) => ({
+          id: `${item.id}_${idx + 1}`,
+          fileName: f.fileName,
+          mediaUrl: f.url,
+          isVideo: f.isVideo,
+          needsResolve: false
+        })),
+        jobDir,
+        { proxyUrl: settings.proxyUrl }
+      );
+      if (downloaded.length === 0) {
+        cleanup();
+        return res.status(502).send('Failed downloading carousel slides');
+      }
+
+      const archive = createZipArchive({ store: true });
+      const zipFilename = `${clean}_${item.code || itemId}_carousel_${downloaded.length}_slides.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+      res.on('finish', cleanup);
+      res.on('close', cleanup);
+      archive.on('error', () => {
+        cleanup();
+        if (!res.headersSent) res.status(500).send('Error creating carousel ZIP');
+      });
+      archive.pipe(res);
+      for (const f of downloaded) {
+        archive.file(f.filePath, { name: f.entryName });
+      }
+      archive.finalize();
+      return;
+    }
+
+    // Single full-HD MP4 video or full-resolution photo
+    const targetFile = resolvedFiles[0];
+    const safeName = (targetFile.fileName || `${itemId}.${targetFile.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const destPath = path.join(jobDir, safeName);
+
+    await downloadFile(targetFile.url, destPath, {
       proxyUrl: settings.proxyUrl,
       force: true
     });

@@ -970,12 +970,14 @@ async function downloadSingleCachedItem(username, itemId) {
 
     const link = document.createElement('a');
     link.href = downloadUrl;
-    link.download = targetItem?.fileName || 'media';
+    if (activeTempMode !== 'manifest') {
+      link.download = targetItem?.fileName || 'media';
+    }
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
 
-    showToast(`Downloading ${targetItem?.fileName || 'media file'} (auto-cleaned on server)...`, 'info');
+    showToast(`Resolving full-HD ${targetItem?.isVideo ? 'MP4 video' : 'media'} & downloading (auto-cleaned on server)...`, 'info');
 
     setTimeout(() => {
       if (btn) {

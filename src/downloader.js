@@ -232,19 +232,22 @@ function extractMediaObjects(obj, collected = []) {
         captionText = obj.accessibility_caption;
       }
 
-      let isVideo = obj.media_type === 2 || obj.product_type === 'clips' || Boolean(obj.video_url);
+      const rawVideo = obj.video_url || obj.video_versions?.[0]?.url || null;
+      const rawDisplay = obj.image_versions2?.candidates?.[0]?.url || obj.display_uri || obj.display_url || null;
+
+      let isVideo = obj.media_type === 2 || obj.product_type === 'clips' || Boolean(rawVideo);
       const isCarousel = obj.product_type === 'carousel_container' ||
                          obj.media_type === 8 ||
                          (obj.carousel_media_count && obj.carousel_media_count > 1) ||
                          Boolean(obj.carousel_media);
 
       // Clean display URL
-      const displayUrl = obj.display_uri 
-        ? obj.display_uri.replace(/\\u0026/g, '&').replace(/\\\//g, '/')
+      const displayUrl = rawDisplay
+        ? rawDisplay.replace(/\\u0026/g, '&').replace(/\\\//g, '/')
         : null;
 
-      const videoUrl = obj.video_url
-        ? obj.video_url.replace(/\\u0026/g, '&').replace(/\\\//g, '/')
+      const videoUrl = rawVideo
+        ? rawVideo.replace(/\\u0026/g, '&').replace(/\\\//g, '/')
         : null;
 
       if (displayUrl || videoUrl) {
@@ -390,74 +393,100 @@ function extractHighlightsFromScripts(scripts) {
 }
 
 /**
- * Fetch and extract all slides for a carousel post
+ * Fetch real full-resolution media for any Instagram post/reel/carousel shortcode.
+ * Resolves actual playable MP4 video_versions, full-res image_versions2, and all carousel slides.
  */
-async function fetchPostSlides(shortcode, options = {}) {
-  const slides = [];
-  const url = `https://www.instagram.com/p/${shortcode}/`;
+async function fetchPostMedia(shortcode, options = {}) {
+  const result = {
+    code: shortcode,
+    isVideo: false,
+    videoUrl: null,
+    imageUrl: null,
+    isCarousel: false,
+    slides: []
+  };
+  if (!shortcode) return result;
 
-  const slideHeaders = getBrowserHeaders();
+  const url = `https://www.instagram.com/p/${shortcode}/`;
+  const headers = getBrowserHeaders();
   const cookieHeader = formatCookieHeader(options.sessionCookie);
   if (cookieHeader) {
-    slideHeaders['Cookie'] = cookieHeader;
+    headers['Cookie'] = cookieHeader;
   }
 
-  const fetchOptions = {
-    method: 'GET',
-    headers: slideHeaders,
-    signal: AbortSignal.timeout(15000)
-  };
-
   try {
-    const { response: res } = await httpFetch(url, fetchOptions, { proxyUrl: options.proxyUrl });
-    if (!res.ok) return slides;
+    const { response: res } = await httpFetch(url, {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(15000)
+    }, { proxyUrl: options.proxyUrl });
+
+    if (!res.ok) return result;
 
     const html = await res.text();
     const scripts = [...html.matchAll(/<script type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
 
+    let postObj = null;
     for (const s of scripts) {
-      if (s.includes('carousel_media') && s.includes(shortcode)) {
+      if (s.includes(shortcode) && (s.includes('video_versions') || s.includes('image_versions2') || s.includes('carousel_media'))) {
         try {
           const parsed = JSON.parse(s);
-
-          function findCarouselMedia(obj) {
-            if (!obj || typeof obj !== 'object') return;
-
-            if (Array.isArray(obj.carousel_media) && obj.carousel_media.length > 0) {
-              obj.carousel_media.forEach((child, index) => {
-                const isVideo = child.media_type === 2 || Boolean(child.video_versions && child.video_versions.length > 0);
-                const bestImage = child.image_versions2?.candidates?.[0]?.url || child.display_uri;
-                const bestVideo = isVideo ? (child.video_versions?.[0]?.url || null) : null;
-                const cleanImg = bestImage ? bestImage.replace(/\\u0026/g, '&').replace(/\\\//g, '/') : null;
-                const cleanVid = bestVideo ? bestVideo.replace(/\\u0026/g, '&').replace(/\\\//g, '/') : null;
-
-                slides.push({
-                  index: index + 1,
-                  id: String(child.pk || child.id || `${shortcode}_${index + 1}`),
-                  isVideo,
-                  url: (isVideo && cleanVid) ? cleanVid : cleanImg,
-                  displayUrl: cleanImg
-                });
-              });
+          function scan(obj) {
+            if (!obj || typeof obj !== 'object' || postObj) return;
+            if (obj.code === shortcode && (obj.video_versions || obj.image_versions2 || obj.carousel_media)) {
+              postObj = obj;
               return;
             }
-
             for (const k of Object.keys(obj)) {
-              if (slides.length > 0) break;
-              findCarouselMedia(obj[k]);
+              if (postObj) break;
+              scan(obj[k]);
             }
           }
-
-          findCarouselMedia(parsed);
-          if (slides.length > 0) break;
+          scan(parsed);
+          if (postObj) break;
         } catch (e) {}
       }
     }
+
+    if (postObj) {
+      const cleanUrl = (u) => u ? String(u).replace(/\\u0026/g, '&').replace(/\\\//g, '/') : null;
+
+      if (Array.isArray(postObj.carousel_media) && postObj.carousel_media.length > 0) {
+        result.isCarousel = true;
+        postObj.carousel_media.forEach((child, index) => {
+          const childVideo = cleanUrl(child.video_versions?.[0]?.url || child.video_url);
+          const childImg = cleanUrl(child.image_versions2?.candidates?.[0]?.url || child.display_uri);
+          const isVid = child.media_type === 2 || Boolean(childVideo);
+          if (childVideo || childImg) {
+            result.slides.push({
+              index: index + 1,
+              id: String(child.pk || child.id || `${shortcode}_${index + 1}`),
+              isVideo: isVid,
+              url: (isVid && childVideo) ? childVideo : childImg,
+              displayUrl: childImg
+            });
+          }
+        });
+      }
+
+      result.videoUrl = cleanUrl(postObj.video_versions?.[0]?.url || postObj.video_url);
+      result.imageUrl = cleanUrl(postObj.image_versions2?.candidates?.[0]?.url || postObj.display_uri);
+      result.isVideo = postObj.media_type === 2 || postObj.product_type === 'clips' || Boolean(result.videoUrl);
+    }
   } catch (err) {
-    console.warn(`[Slides] Error fetching slides for ${shortcode}:`, err.message);
+    console.warn(`[PostMedia] Error resolving ${shortcode}:`, err.message);
   }
 
-  return slides;
+  return result;
+}
+
+/**
+ * Fetch and extract all slides for a carousel post
+ */
+async function fetchPostSlides(shortcode, options = {}) {
+  const resolved = await fetchPostMedia(shortcode, options);
+  return resolved.slides || [];
 }
 
 /**
@@ -1051,7 +1080,17 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       // Download single posts concurrently at high speed while resolving carousel slides in parallel
       const singleDownloadPromise = runWithConcurrency(singlePosts, downloadConcurrency, async (post) => {
         const mediaId = post.pk || post.code;
-        const isVideoWithSource = post.isVideo && Boolean(post.videoUrl);
+        let resolvedVideoUrl = post.videoUrl || null;
+        let resolvedDisplayUrl = post.displayUrl || null;
+
+        // Profile grid HTML omits video_versions & full-res image_versions2 — resolve real MP4 / HD image!
+        if (post.code && ((post.isVideo && !resolvedVideoUrl) || (resolvedDisplayUrl && resolvedDisplayUrl.includes('s640x640')))) {
+          const resolved = await fetchPostMedia(post.code, dlOptions);
+          if (resolved.videoUrl) resolvedVideoUrl = resolved.videoUrl;
+          if (resolved.imageUrl) resolvedDisplayUrl = resolved.imageUrl;
+        }
+
+        const isVideoWithSource = (post.isVideo || Boolean(resolvedVideoUrl)) && Boolean(resolvedVideoUrl);
         const ext = isVideoWithSource ? 'mp4' : 'jpg';
         const mainFileName = `${post.code}.${ext}`;
         const mainPath = path.join(postsDir, mainFileName);
@@ -1063,25 +1102,25 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
           let downloadedThumb = false;
 
           if (isVideoWithSource) {
-            // Download MP4 video and thumbnail simultaneously
+            // Download real MP4 video and full-res thumbnail simultaneously
             const dlTasks = [
-              downloadFile(post.videoUrl, mainPath, dlOptions)
+              downloadFile(resolvedVideoUrl, mainPath, dlOptions)
                 .then(vidDl => {
                   if (vidDl || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
                     fileReady = true;
                   }
                 })
             ];
-            if (post.displayUrl) {
+            if (resolvedDisplayUrl) {
               dlTasks.push(
-                downloadFile(post.displayUrl, thumbPath, dlOptions)
+                downloadFile(resolvedDisplayUrl, thumbPath, dlOptions)
                   .then(() => { downloadedThumb = true; })
                   .catch(() => {})
               );
             }
             await Promise.all(dlTasks);
-          } else if (post.displayUrl) {
-            const imgDownloaded = await downloadFile(post.displayUrl, mainPath, dlOptions);
+          } else if (resolvedDisplayUrl) {
+            const imgDownloaded = await downloadFile(resolvedDisplayUrl, mainPath, dlOptions);
             if (imgDownloaded || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
               fileReady = true;
             }
@@ -1962,20 +2001,28 @@ async function inspectProfileMedia(username, options = {}) {
         });
       }
     } else {
-      const isVideoWithSource = Boolean(post.isVideo && post.videoUrl);
-      const mediaUrl = isVideoWithSource ? post.videoUrl : post.displayUrl;
+      const isVideo = Boolean(post.isVideo || post.videoUrl);
+      const isCarousel = Boolean(post.isCarousel || (post.carouselCount && post.carouselCount > 1));
+      const mediaUrl = post.videoUrl || post.displayUrl;
       if (!mediaUrl) continue;
       const thumbUrl = post.displayUrl || mediaUrl;
-      const ext = isVideoWithSource ? 'mp4' : 'jpg';
+      const ext = isVideo ? 'mp4' : 'jpg';
+      const needsResolve = Boolean(
+        post.code &&
+        !String(post.code).startsWith('mirror_') &&
+        ((isVideo && !post.videoUrl) || isCarousel || (post.displayUrl && post.displayUrl.includes('s640x640')))
+      );
       manifest.items.push({
         id: String(post.pk || post.code),
         code: String(post.code || post.pk),
-        type: isVideoWithSource ? 'video_post' : 'photo_post',
+        type: isVideo ? 'video_post' : (isCarousel ? 'carousel_slide' : 'photo_post'),
         fileName: `${post.code || post.pk}.${ext}`,
         mediaUrl,
         thumbnailUrl: makeProxyUrl(thumbUrl),
         fileUrl: makeProxyUrl(mediaUrl),
-        isVideo: isVideoWithSource,
+        isVideo,
+        isCarousel,
+        needsResolve,
         caption: post.caption || ''
       });
     }
@@ -2123,29 +2170,104 @@ async function inspectHighlightReel(username, highlightId, highlightTitle = 'Hig
 }
 
 /**
- * Phase 2: Download ONLY the requested items into an isolated temporary directory
- * concurrently (bounded by DOWNLOAD_CONCURRENCY) for immediate streaming + cleanup.
+ * Resolve an inspected manifest item into actual full-HD downloadable file(s):
+ * - Video / Reel posts -> real playable .mp4 URL
+ * - Carousel posts -> all full-resolution photo & .mp4 video slides
+ * - Photo posts -> full-resolution original JPEG (not 640x640 grid thumbnail)
+ */
+async function resolveItemForDownload(item, options = {}) {
+  if (!item) return [];
+  const shouldResolve = Boolean(
+    item.needsResolve ||
+    (item.code && !String(item.code).startsWith('mirror_') && item.type !== 'profile_pic' && !item.type?.includes('highlight') && !item.type?.includes('story') && (
+      (item.isVideo && !String(item.mediaUrl || '').includes('.mp4')) ||
+      item.isCarousel ||
+      String(item.mediaUrl || '').includes('s640x640')
+    ))
+  );
+
+  if (!shouldResolve) {
+    return item.mediaUrl ? [{
+      url: item.mediaUrl,
+      fileName: item.fileName || `${item.id}.${item.isVideo ? 'mp4' : 'jpg'}`,
+      isVideo: Boolean(item.isVideo)
+    }] : [];
+  }
+
+  const resolved = await fetchPostMedia(item.code, options);
+  if (resolved.isCarousel && resolved.slides.length > 0) {
+    return resolved.slides.map(slide => ({
+      url: slide.url,
+      fileName: `${item.code}_slide_${slide.index}.${slide.isVideo ? 'mp4' : 'jpg'}`,
+      isVideo: Boolean(slide.isVideo)
+    }));
+  }
+
+  if (resolved.videoUrl) {
+    return [{
+      url: resolved.videoUrl,
+      fileName: `${item.code}.mp4`,
+      isVideo: true
+    }];
+  }
+
+  if (resolved.imageUrl) {
+    return [{
+      url: resolved.imageUrl,
+      fileName: `${item.code}.jpg`,
+      isVideo: false
+    }];
+  }
+
+  return item.mediaUrl ? [{
+    url: item.mediaUrl,
+    fileName: item.fileName || `${item.id}.${item.isVideo ? 'mp4' : 'jpg'}`,
+    isVideo: Boolean(item.isVideo)
+  }] : [];
+}
+
+/**
+ * Phase 2: Resolve real full-HD media URLs & download ONLY the requested items
+ * into an isolated temporary directory concurrently for immediate streaming + cleanup.
  */
 async function downloadItemsToTempDir(items, tempDir, options = {}) {
   if (!fs.existsSync(tempDir)) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
   const concurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
+  const metaConcurrency = options.metadataConcurrency || config.METADATA_CONCURRENCY || 3;
   const dlOptions = { ...options, force: true, _limiter: createLimiter(concurrency) };
+
+  // Step 1: Resolve real full-HD MP4 / full-res image / carousel slides concurrently
+  const resolvedNested = await runWithConcurrency(items, metaConcurrency, async (item) => {
+    try {
+      const files = await resolveItemForDownload(item, dlOptions);
+      return files.map(f => ({ ...f, sourceId: item.id }));
+    } catch (e) {
+      return item?.mediaUrl ? [{
+        url: item.mediaUrl,
+        fileName: item.fileName || `${item.id}.${item.isVideo ? 'mp4' : 'jpg'}`,
+        isVideo: Boolean(item.isVideo),
+        sourceId: item.id
+      }] : [];
+    }
+  });
+
+  const downloadQueue = resolvedNested.flat().filter(f => Boolean(f.url));
   const downloaded = [];
 
-  await runWithConcurrency(items, concurrency, async (item, idx) => {
-    const url = item?.mediaUrl;
-    if (!url) return;
-    const safeName = (item.fileName || `media_${idx + 1}.${item.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+  // Step 2: Stream all resolved full-HD files into the temp dir concurrently
+  await runWithConcurrency(downloadQueue, concurrency, async (entry, idx) => {
+    const safeName = (entry.fileName || `media_${idx + 1}.${entry.isVideo ? 'mp4' : 'jpg'}`).replace(/[^a-zA-Z0-9._-]/g, '_');
     const destPath = path.join(tempDir, `${idx + 1}_${safeName}`);
     try {
-      const ok = await downloadFile(url, destPath, dlOptions);
+      const ok = await downloadFile(entry.url, destPath, dlOptions);
       if (ok && fs.existsSync(destPath)) {
         downloaded.push({
-          ...item,
+          id: entry.sourceId || String(idx + 1),
           filePath: destPath,
-          entryName: safeName
+          entryName: safeName,
+          isVideo: entry.isVideo
         });
       }
     } catch (e) {
@@ -2160,6 +2282,8 @@ module.exports = {
   downloadTargetContent,
   inspectProfileMedia,
   inspectHighlightReel,
+  resolveItemForDownload,
+  fetchPostMedia,
   downloadItemsToTempDir,
   downloadFile,
   runWithConcurrency,
