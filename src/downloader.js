@@ -75,18 +75,33 @@ function formatCookieHeader(sessionCookie) {
   return raw.includes('=') ? raw : `sessionid=${raw}`;
 }
 
-function isLoginWallResponse(res, html = '') {
+function isLoginWallResponse(res, html = '', cleanUsername = '') {
   const finalUrl = res?.url || '';
-  return (
+  if (
     res?.status === 401 ||
     res?.status === 403 ||
     res?.status === 429 ||
     finalUrl.includes('/accounts/login') ||
-    finalUrl.includes('/challenge/') ||
+    finalUrl.includes('/challenge/')
+  ) {
+    return true;
+  }
+  if (!html) return false;
+  if (
     html.includes('<title>Login • Instagram</title>') ||
+    html.includes('Login • Instagram') ||
     html.includes('"pageID":"CAAIGLoginHomepage"') ||
     html.includes('checkpoint_required')
-  );
+  ) {
+    return true;
+  }
+  // Instagram serves a stripped generic "<title>Instagram</title>" shell to blocked datacenter IPs (e.g. Render/AWS)
+  const isGenericShell = /<title>\s*Instagram\s*<\/title>/i.test(html) && !html.includes('og:image');
+  if (isGenericShell) return true;
+  if (cleanUsername && !html.toLowerCase().includes(cleanUsername.toLowerCase()) && !html.includes('display_uri')) {
+    return true;
+  }
+  return false;
 }
 
 const USER_AGENTS = [
@@ -850,8 +865,10 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 
       if (res.ok) {
         html = await res.text();
-        if (isLoginWallResponse(res, html)) {
+        if (isLoginWallResponse(res, html, clean)) {
           stage1Blocked = true;
+          summary.blockedByInstagram = true;
+          summary.errors.push('Instagram blocked this cloud server IP (login wall / datacenter IP block). Add a Proxy URL or burner Session Cookie in Settings, or run locally.');
           html = '';
         } else {
           if (/this account is private|follow to see their photos and videos/i.test(html)) {
@@ -953,7 +970,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     }
 
     // Stage 3: Anonymous Public Mirror Fallback (works even when Render datacenter IPs are blocked by Instagram)
-    if (allMedia.length === 0 && !isPrivateProfile && stage1Blocked) {
+    if (allMedia.length === 0 && !isPrivateProfile) {
       try {
         const mirrorRes = await anonyigProvider.fetchPublicMirrorMedia(clean);
         if (mirrorRes && mirrorRes.success && Array.isArray(mirrorRes.items) && mirrorRes.items.length > 0) {
@@ -1285,11 +1302,19 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
       ? Number((summary.newlyDownloaded / (summary.durationMs / 1000)).toFixed(1))
       : summary.newlyDownloaded;
 
-    db.addLog(
-      `Content download complete for @${clean}: ${summary.newlyDownloaded} media files in ${(summary.durationMs / 1000).toFixed(1)}s (${summary.itemsPerSec} files/s, source=${summary.source}).`,
-      summary.newlyDownloaded > 0 ? 'success' : 'info',
-      clean
-    );
+    if (summary.newlyDownloaded === 0 && (summary.blockedByInstagram || stage1Blocked)) {
+      db.addLog(
+        `⚠️ Instagram blocked this server's datacenter IP for @${clean} (0 files). Add a Proxy URL or burner IG Session Cookie in Settings, or run locally.`,
+        'warning',
+        clean
+      );
+    } else {
+      db.addLog(
+        `Content download complete for @${clean}: ${summary.newlyDownloaded} media files in ${(summary.durationMs / 1000).toFixed(1)}s (${summary.itemsPerSec} files/s, source=${summary.source}).`,
+        summary.newlyDownloaded > 0 ? 'success' : 'info',
+        clean
+      );
+    }
 
     return summary;
   } catch (err) {
@@ -1838,8 +1863,10 @@ async function inspectProfileMedia(username, options = {}) {
 
     if (res.ok) {
       html = await res.text();
-      if (isLoginWallResponse(res, html)) {
+      if (isLoginWallResponse(res, html, clean)) {
         stage1Blocked = true;
+        manifest.blockedByInstagram = true;
+        manifest.errors.push('Instagram blocked this cloud server IP (datacenter IP block). Add a Proxy URL or burner IG Session Cookie in Settings, or use Backup Viewer / run locally.');
         html = '';
       } else {
         if (/this account is private|follow to see their photos and videos/i.test(html)) {
@@ -1935,7 +1962,7 @@ async function inspectProfileMedia(username, options = {}) {
   }
 
   // Stage 3: Anonymous Public Mirror Fallback
-  if (allMedia.length === 0 && !manifest.isPrivate && stage1Blocked) {
+  if (allMedia.length === 0 && !manifest.isPrivate) {
     try {
       const mirrorRes = await anonyigProvider.fetchPublicMirrorMedia(clean);
       if (mirrorRes && mirrorRes.success && Array.isArray(mirrorRes.items) && mirrorRes.items.length > 0) {
