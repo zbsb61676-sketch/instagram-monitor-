@@ -7,14 +7,51 @@ require('./dnsPatch');
 
 const fs = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
 const config = require('./config');
 const db = require('./db');
 const cacheManager = require('./cacheManager');
 const proxyManager = require('./proxyManager');
 
+// Reusable HTTP Keep-Alive connection pool for high-speed CDN media downloads
+let cdnKeepAliveAgent = null;
+try {
+  const { Agent } = require('undici');
+  cdnKeepAliveAgent = new Agent({
+    connections: 16,
+    keepAliveTimeout: 15000,
+    keepAliveMaxTimeout: 60000,
+    pipelining: 1
+  });
+} catch (e) {}
+
 // Ensure base downloads folder exists
 if (!fs.existsSync(config.DOWNLOADS_DIR)) {
   fs.mkdirSync(config.DOWNLOADS_DIR, { recursive: true });
+}
+
+/**
+ * Bounded concurrent worker pool — speeds up bulk media downloads dramatically
+ * while keeping concurrency safely capped to prevent memory spikes or rate limits.
+ */
+async function runWithConcurrency(items, concurrency, workerFn) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const limit = Math.max(1, Math.min(concurrency || 1, items.length));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) break;
+      results[idx] = await workerFn(items[idx], idx);
+    }
+  }
+
+  const workers = Array.from({ length: limit }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 function formatCookieHeader(sessionCookie) {
@@ -23,7 +60,7 @@ function formatCookieHeader(sessionCookie) {
   return raw.includes('=') ? raw : `sessionid=${raw}`;
 }
 
-function applyProxy(fetchOptions, proxyUrl) {
+function applyProxy(fetchOptions, proxyUrl, useKeepAlivePool = false) {
   const activeProxy = proxyManager.getNextProxy(proxyUrl);
   if (activeProxy) {
     try {
@@ -32,6 +69,8 @@ function applyProxy(fetchOptions, proxyUrl) {
     } catch (e) {
       // ignore
     }
+  } else if (useKeepAlivePool && cdnKeepAliveAgent) {
+    fetchOptions.dispatcher = cdnKeepAliveAgent;
   }
   return activeProxy;
 }
@@ -60,7 +99,8 @@ function getBrowserHeaders() {
 }
 
 /**
- * Download a file from URL and save to destination path atomically
+ * High-speed streaming atomic file downloader with HTTP keep-alive reuse,
+ * automatic transient retry, and guaranteed temporary file cleanup on failure.
  */
 async function downloadFile(url, destPath, options = {}) {
   if (!url) return false;
@@ -75,33 +115,74 @@ async function downloadFile(url, destPath, options = {}) {
     return true;
   }
 
-  let fetchOptions = {
-    method: 'GET',
-    headers: {
-      'User-Agent': getRandomUserAgent(),
-      'Accept': '*/*',
-      'Referer': 'https://www.instagram.com/'
-    },
-    signal: AbortSignal.timeout(25000)
-  };
+  const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 2;
+  const timeoutMs = options.timeoutMs || 25000;
+  let lastErr = null;
 
-  applyProxy(fetchOptions, options.proxyUrl);
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const tempPath = `${destPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+    try {
+      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const signal = options.signal && typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([options.signal, timeoutSignal])
+        : timeoutSignal;
 
-  const res = await fetch(url, fetchOptions);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} downloading ${url}`);
+      const fetchOptions = {
+        method: 'GET',
+        headers: {
+          'User-Agent': getRandomUserAgent(),
+          'Accept': '*/*',
+          'Referer': 'https://www.instagram.com/'
+        },
+        signal
+      };
+
+      applyProxy(fetchOptions, options.proxyUrl, true);
+
+      const res = await fetch(url, fetchOptions);
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status} downloading ${url}`);
+        err.status = res.status;
+        throw err;
+      }
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (contentType.startsWith('text/html')) {
+        const err = new Error(`Unexpected HTML response downloading ${url}`);
+        err.nonRetryable = true;
+        throw err;
+      }
+
+      if (res.body) {
+        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tempPath));
+      } else {
+        const buffer = await res.arrayBuffer();
+        fs.writeFileSync(tempPath, Buffer.from(buffer));
+      }
+
+      const stat = fs.statSync(tempPath);
+      if (stat.size === 0) {
+        throw new Error(`Empty response body downloading ${url}`);
+      }
+
+      fs.renameSync(tempPath, destPath);
+      return true; // Newly downloaded
+    } catch (err) {
+      lastErr = err;
+      // Always clean up partial temp file on failure
+      if (fs.existsSync(tempPath)) {
+        try { fs.unlinkSync(tempPath); } catch (e) {}
+      }
+      if (err.nonRetryable || (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) || options.signal?.aborted) {
+        throw err;
+      }
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+      }
+    }
   }
 
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  if (contentType.startsWith('text/html')) {
-    throw new Error(`Unexpected HTML response downloading ${url}`);
-  }
-
-  const buffer = await res.arrayBuffer();
-  const tempPath = `${destPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
-  fs.writeFileSync(tempPath, Buffer.from(buffer));
-  fs.renameSync(tempPath, destPath);
-  return true; // Newly downloaded
+  throw lastErr || new Error(`Failed downloading ${url}`);
 }
 
 /**
@@ -381,7 +462,10 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
     return db.recordDownloadedMedia(clean, data);
   };
 
-  for (const hl of highlights) {
+  const downloadConcurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
+  const metaConcurrency = options.metadataConcurrency || config.METADATA_CONCURRENCY || 3;
+
+  await runWithConcurrency(highlights, metaConcurrency, async (hl) => {
     const hlId = String(hl.id).replace(/^highlight:/, '');
     const cleanTitle = (hl.title || 'Highlight')
       .replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -526,10 +610,9 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
       } catch (we) {}
     }
 
-    // Process all items in this highlight reel
+    // Process all items in this highlight reel concurrently
     if (reelItems.length > 0) {
-      for (let idx = 0; idx < reelItems.length; idx++) {
-        const item = reelItems[idx];
+      await runWithConcurrency(reelItems, downloadConcurrency, async (item, idx) => {
         const rawId = String(item.pk || item.id || idx).split('_')[0];
         const isVideo = (item.media_type === 2 || item.is_video === true) && (item.video_versions?.length > 0 || item.video_resources?.length > 0 || item.video_url);
 
@@ -541,7 +624,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
                                null;
 
         const mediaUrl = isVideo ? videoUrl : photoCandidate;
-        if (!mediaUrl) continue;
+        if (!mediaUrl) return;
 
         const cleanUrl = mediaUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
         const ext = isVideo ? 'mp4' : 'jpg';
@@ -550,26 +633,34 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
 
         let thumbUrl = null;
         let thumbPath = null;
+        let fileReady = false;
+
+        // Download main media and video thumbnail in parallel
+        const tasks = [
+          downloadFile(cleanUrl, destPath, options)
+            .then((downloaded) => { if (downloaded) fileReady = true; })
+            .catch(() => {
+              if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
+                fileReady = true;
+              }
+            })
+        ];
+
         if (isVideo && photoCandidate) {
           const cleanThumb = photoCandidate.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
           const thumbFileName = `${rawId}_thumb.jpg`;
           const thumbDest = path.join(hlDir, thumbFileName);
-          try {
-            await downloadFile(cleanThumb, thumbDest, options);
-            thumbUrl = `${urlPrefix}/${clean}/highlights/${cleanTitle}_${hlId}/${thumbFileName}`;
-            thumbPath = thumbDest;
-          } catch (te) {}
+          tasks.push(
+            downloadFile(cleanThumb, thumbDest, options)
+              .then(() => {
+                thumbUrl = `${urlPrefix}/${clean}/highlights/${cleanTitle}_${hlId}/${thumbFileName}`;
+                thumbPath = thumbDest;
+              })
+              .catch(() => {})
+          );
         }
 
-        let fileReady = false;
-        try {
-          const downloaded = await downloadFile(cleanUrl, destPath, options);
-          if (downloaded) fileReady = true;
-        } catch (err) {
-          if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
-            fileReady = true;
-          }
-        }
+        await Promise.all(tasks);
 
         if (fileReady) {
           result.newlyDownloaded++;
@@ -591,7 +682,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
             onProgress({ type: 'ITEM_DOWNLOADED', item: recorded, current: result.newlyDownloaded, total: reelItems.length });
           }
         }
-      }
+      });
     } else {
       // Fallback: If no items returned or rate limited, download the highlight cover
       const coverUrl = hl.coverUrl;
@@ -619,7 +710,7 @@ async function downloadAllHighlights(username, highlights = [], highlightsDir, o
         } catch (ce) {}
       }
     }
-  }
+  });
 
   return result;
 }
@@ -654,16 +745,22 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
   });
 
+  const startedAt = Date.now();
+  const downloadConcurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
+  const metaConcurrency = options.metadataConcurrency || config.METADATA_CONCURRENCY || 3;
+
   const summary = {
     username: clean,
     totalFound: 0,
     newlyDownloaded: 0,
     skipped: 0,
     downloadedItems: [],
-    errors: []
+    errors: [],
+    durationMs: 0,
+    itemsPerSec: 0
   };
 
-  db.addLog(`Starting full content archive (posts, slides & highlights) for @${clean}...`, 'info', clean);
+  db.addLog(`Starting high-speed ${isCache ? 'temporary ' : ''}content download (concurrency=${downloadConcurrency}) for @${clean}...`, 'info', clean);
 
   try {
     // 1. Fetch profile HTML page
@@ -700,35 +797,6 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
 
     const html = await res.text();
     const { userId, avatarUrl, fullName, bio } = extractProfileDetails(html, clean);
-
-    // Save profile metadata & avatar (always fetched fresh from Instagram)
-    if (avatarUrl) {
-      const avatarPath = path.join(profileDir, 'avatar.jpg');
-      const avatarMediaId = `avatar_${clean}`;
-      try {
-        const downloaded = await downloadFile(avatarUrl, avatarPath, options);
-        if (downloaded) {
-          summary.newlyDownloaded++;
-          const item = recordMedia({
-            id: avatarMediaId,
-            code: 'avatar',
-            type: 'profile_pic',
-            fileName: 'avatar.jpg',
-            filePath: avatarPath,
-            fileUrl: `${urlPrefix}/${clean}/profile/avatar.jpg`,
-            thumbnailUrl: `${urlPrefix}/${clean}/profile/avatar.jpg`,
-            thumbnailPath: avatarPath,
-            caption: `${fullName || clean} Profile Picture`
-          });
-          summary.downloadedItems.push(item);
-          if (typeof onProgress === 'function') {
-            onProgress({ type: 'ITEM_DOWNLOADED', item, current: summary.newlyDownloaded, total: summary.totalFound });
-          }
-        }
-      } catch (err) {
-        summary.errors.push(`Avatar download failed: ${err.message}`);
-      }
-    }
 
     // Save profile bio text
     if (bio || fullName || userId) {
@@ -767,7 +835,7 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     const uniquePosts = Array.from(uniquePostsMap.values());
     summary.totalFound += uniquePosts.length;
 
-    // 3. Extract and Download Highlights (always downloaded fresh)
+    // 3. Discover Highlights
     let highlights = extractHighlightsFromScripts(scripts);
     if (highlights.length === 0) {
       const knownHlIds = new Set();
@@ -786,58 +854,170 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
     }
     summary.totalFound += highlights.length;
 
-    if (highlights.length > 0) {
+    // 4. Execute Avatar, Highlights, Posts/Carousels, and Active Stories IN PARALLEL!
+    const avatarTask = async () => {
+      if (!avatarUrl) return;
+      const avatarPath = path.join(profileDir, 'avatar.jpg');
+      const avatarMediaId = `avatar_${clean}`;
+      try {
+        const downloaded = await downloadFile(avatarUrl, avatarPath, options);
+        if (downloaded) {
+          summary.newlyDownloaded++;
+          const item = recordMedia({
+            id: avatarMediaId,
+            code: 'avatar',
+            type: 'profile_pic',
+            fileName: 'avatar.jpg',
+            filePath: avatarPath,
+            fileUrl: `${urlPrefix}/${clean}/profile/avatar.jpg`,
+            thumbnailUrl: `${urlPrefix}/${clean}/profile/avatar.jpg`,
+            thumbnailPath: avatarPath,
+            caption: `${fullName || clean} Profile Picture`
+          });
+          summary.downloadedItems.push(item);
+          if (typeof onProgress === 'function') {
+            onProgress({ type: 'ITEM_DOWNLOADED', item, current: summary.newlyDownloaded, total: summary.totalFound });
+          }
+        }
+      } catch (err) {
+        summary.errors.push(`Avatar download failed: ${err.message}`);
+      }
+    };
+
+    const highlightsTask = async () => {
+      if (highlights.length === 0) return;
       const hlResult = await downloadAllHighlights(clean, highlights, highlightsDir, options, onProgress);
       summary.newlyDownloaded += hlResult.newlyDownloaded;
       summary.downloadedItems.push(...hlResult.items);
       if (hlResult.errors?.length > 0) {
         summary.errors.push(...hlResult.errors);
       }
-    }
+    };
 
-    // 4. Download Posts & Carousel Slides with Strict Deduplication
-    for (const post of uniquePosts) {
-      const isCarousel = post.isCarousel || post.productType === 'carousel_container' || (post.carouselCount && post.carouselCount > 1);
+    const postsTask = async () => {
+      // Split carousel posts (need page fetch) vs direct single posts (immediate CDN download)
+      const carouselPosts = [];
+      const singlePosts = [];
 
-      if (isCarousel) {
-        // Fetch all slides for carousel post
+      for (const post of uniquePosts) {
+        const isCarousel = post.isCarousel || post.productType === 'carousel_container' || (post.carouselCount && post.carouselCount > 1);
+        if (isCarousel) carouselPosts.push(post);
+        else singlePosts.push(post);
+      }
+
+      // Download single posts concurrently at high speed while resolving carousel slides in parallel
+      const singleDownloadPromise = runWithConcurrency(singlePosts, downloadConcurrency, async (post) => {
+        const mediaId = post.pk || post.code;
+        const isVideoWithSource = post.isVideo && Boolean(post.videoUrl);
+        const ext = isVideoWithSource ? 'mp4' : 'jpg';
+        const mainFileName = `${post.code}.${ext}`;
+        const mainPath = path.join(postsDir, mainFileName);
+        const thumbFileName = `${post.code}_thumb.jpg`;
+        const thumbPath = path.join(postsDir, thumbFileName);
+
+        try {
+          let fileReady = false;
+          let downloadedThumb = false;
+
+          if (isVideoWithSource) {
+            // Download MP4 video and thumbnail simultaneously
+            const dlTasks = [
+              downloadFile(post.videoUrl, mainPath, options)
+                .then(vidDl => {
+                  if (vidDl || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
+                    fileReady = true;
+                  }
+                })
+            ];
+            if (post.displayUrl) {
+              dlTasks.push(
+                downloadFile(post.displayUrl, thumbPath, options)
+                  .then(() => { downloadedThumb = true; })
+                  .catch(() => {})
+              );
+            }
+            await Promise.all(dlTasks);
+          } else if (post.displayUrl) {
+            const imgDownloaded = await downloadFile(post.displayUrl, mainPath, options);
+            if (imgDownloaded || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
+              fileReady = true;
+            }
+          }
+
+          if (fileReady) {
+            summary.newlyDownloaded++;
+
+            if (post.caption) {
+              fs.writeFileSync(path.join(postsDir, `${post.code}_caption.txt`), post.caption, 'utf-8');
+            }
+            fs.writeFileSync(path.join(postsDir, `${post.code}.json`), JSON.stringify(post, null, 2), 'utf-8');
+
+            const record = recordMedia({
+              id: mediaId,
+              code: post.code,
+              type: post.isVideo ? 'video_post' : 'photo_post',
+              fileName: mainFileName,
+              filePath: mainPath,
+              fileUrl: `${urlPrefix}/${clean}/posts/${mainFileName}`,
+              thumbnailUrl: (isVideoWithSource && downloadedThumb) ? `${urlPrefix}/${clean}/posts/${thumbFileName}` : `${urlPrefix}/${clean}/posts/${mainFileName}`,
+              thumbnailPath: (isVideoWithSource && downloadedThumb) ? thumbPath : mainPath,
+              caption: post.caption
+            });
+            summary.downloadedItems.push(record);
+            if (typeof onProgress === 'function') {
+              onProgress({ type: 'ITEM_DOWNLOADED', item: record, current: summary.newlyDownloaded, total: summary.totalFound });
+            }
+          }
+        } catch (postErr) {
+          summary.errors.push(`Post ${post.code} download error: ${postErr.message}`);
+        }
+      });
+
+      const carouselDownloadPromise = runWithConcurrency(carouselPosts, metaConcurrency, async (post) => {
         const slides = await fetchPostSlides(post.code, options);
-
         if (slides.length > 0) {
           summary.totalFound += slides.length;
 
-          // Save caption if present
           if (post.caption) {
             fs.writeFileSync(path.join(postsDir, `${post.code}_caption.txt`), post.caption, 'utf-8');
           }
-
-          // Save post metadata json with slides
           fs.writeFileSync(path.join(postsDir, `${post.code}.json`), JSON.stringify({ ...post, slides }, null, 2), 'utf-8');
 
-          for (const slide of slides) {
+          await runWithConcurrency(slides, downloadConcurrency, async (slide) => {
             const slideId = `${post.code}_slide_${slide.index}`;
             const ext = slide.isVideo ? 'mp4' : 'jpg';
             const fileName = `${post.code}_slide_${slide.index}.${ext}`;
             const destPath = path.join(postsDir, fileName);
 
             try {
-              const downloaded = await downloadFile(slide.url, destPath, options);
+              let thumbnailUrl = null;
+              let thumbnailPath = null;
+              let downloaded = false;
+
+              const slideTasks = [
+                downloadFile(slide.url, destPath, options).then(ok => { downloaded = ok; })
+              ];
+
+              if (slide.isVideo && slide.displayUrl) {
+                const thumbFileName = `${post.code}_slide_${slide.index}_thumb.jpg`;
+                const tPath = path.join(postsDir, thumbFileName);
+                slideTasks.push(
+                  downloadFile(slide.displayUrl, tPath, options)
+                    .then(() => {
+                      thumbnailPath = tPath;
+                      thumbnailUrl = `${urlPrefix}/${clean}/posts/${thumbFileName}`;
+                    })
+                    .catch(() => {})
+                );
+              } else if (!slide.isVideo) {
+                thumbnailUrl = `${urlPrefix}/${clean}/posts/${fileName}`;
+                thumbnailPath = destPath;
+              }
+
+              await Promise.all(slideTasks);
+
               if (downloaded) {
                 summary.newlyDownloaded++;
-                let thumbnailUrl = null;
-                let thumbnailPath = null;
-                if (slide.isVideo && slide.displayUrl) {
-                  const thumbFileName = `${post.code}_slide_${slide.index}_thumb.jpg`;
-                  thumbnailPath = path.join(postsDir, thumbFileName);
-                  try {
-                    await downloadFile(slide.displayUrl, thumbnailPath, options);
-                    thumbnailUrl = `${urlPrefix}/${clean}/posts/${thumbFileName}`;
-                  } catch (e) {}
-                } else if (!slide.isVideo) {
-                  thumbnailUrl = `${urlPrefix}/${clean}/posts/${fileName}`;
-                  thumbnailPath = destPath;
-                }
-
                 const record = recordMedia({
                   id: slideId,
                   code: post.code,
@@ -859,82 +1039,70 @@ async function downloadTargetContent(username, options = {}, onProgress = null) 
             } catch (slideErr) {
               summary.errors.push(`Slide ${slide.index} of post ${post.code} error: ${slideErr.message}`);
             }
-          }
-          continue; // Finished processing carousel post
-        }
-      }
-
-      // Standard single image/video post (always downloaded fresh)
-      const mediaId = post.pk || post.code;
-      const isVideoWithSource = post.isVideo && Boolean(post.videoUrl);
-      const ext = isVideoWithSource ? 'mp4' : 'jpg';
-      const mainFileName = `${post.code}.${ext}`;
-      const mainPath = path.join(postsDir, mainFileName);
-      const thumbFileName = `${post.code}_thumb.jpg`;
-      const thumbPath = path.join(postsDir, thumbFileName);
-
-      try {
-        let fileReady = false;
-        let downloadedThumb = false;
-
-        if (isVideoWithSource) {
-          // Download MP4 video
-          const vidDl = await downloadFile(post.videoUrl, mainPath, options);
-          if (vidDl || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
-            fileReady = true;
-          }
-          // Download video thumbnail
-          if (post.displayUrl) {
-            await downloadFile(post.displayUrl, thumbPath, options);
-            downloadedThumb = true;
-          }
-        } else if (post.displayUrl) {
-          const imgDownloaded = await downloadFile(post.displayUrl, mainPath, options);
-          if (imgDownloaded || (fs.existsSync(mainPath) && fs.statSync(mainPath).size > 1000)) {
-            fileReady = true;
-          }
-        }
-
-        if (fileReady) {
-          summary.newlyDownloaded++;
-
-          if (post.caption) {
-            fs.writeFileSync(path.join(postsDir, `${post.code}_caption.txt`), post.caption, 'utf-8');
-          }
-          fs.writeFileSync(path.join(postsDir, `${post.code}.json`), JSON.stringify(post, null, 2), 'utf-8');
-
-          const record = recordMedia({
-            id: mediaId,
-            code: post.code,
-            type: post.isVideo ? 'video_post' : 'photo_post',
-            fileName: mainFileName,
-            filePath: mainPath,
-            fileUrl: `${urlPrefix}/${clean}/posts/${mainFileName}`,
-            thumbnailUrl: (isVideoWithSource && downloadedThumb) ? `${urlPrefix}/${clean}/posts/${thumbFileName}` : `${urlPrefix}/${clean}/posts/${mainFileName}`,
-            thumbnailPath: (isVideoWithSource && downloadedThumb) ? thumbPath : mainPath,
-            caption: post.caption
           });
-          summary.downloadedItems.push(record);
-          if (typeof onProgress === 'function') {
-            onProgress({ type: 'ITEM_DOWNLOADED', item: record, current: summary.newlyDownloaded, total: summary.totalFound });
+        } else if (post.displayUrl || post.videoUrl) {
+          // Fallback to cover media if carousel slide extraction returned empty
+          const mediaId = post.pk || post.code;
+          const ext = post.isVideo && post.videoUrl ? 'mp4' : 'jpg';
+          const mainFileName = `${post.code}.${ext}`;
+          const mainPath = path.join(postsDir, mainFileName);
+          try {
+            const downloaded = await downloadFile(post.isVideo && post.videoUrl ? post.videoUrl : post.displayUrl, mainPath, options);
+            if (downloaded) {
+              summary.newlyDownloaded++;
+              const record = recordMedia({
+                id: mediaId,
+                code: post.code,
+                type: post.isVideo ? 'video_post' : 'photo_post',
+                fileName: mainFileName,
+                filePath: mainPath,
+                fileUrl: `${urlPrefix}/${clean}/posts/${mainFileName}`,
+                thumbnailUrl: `${urlPrefix}/${clean}/posts/${mainFileName}`,
+                thumbnailPath: mainPath,
+                caption: post.caption
+              });
+              summary.downloadedItems.push(record);
+              if (typeof onProgress === 'function') {
+                onProgress({ type: 'ITEM_DOWNLOADED', item: record, current: summary.newlyDownloaded, total: summary.totalFound });
+              }
+            }
+          } catch (fallbackErr) {
+            summary.errors.push(`Carousel ${post.code} fallback error: ${fallbackErr.message}`);
           }
         }
-      } catch (postErr) {
-        summary.errors.push(`Post ${post.code} download error: ${postErr.message}`);
+      });
+
+      await Promise.all([singleDownloadPromise, carouselDownloadPromise]);
+    };
+
+    const storiesTask = async () => {
+      try {
+        const storiesResult = await downloadActiveStories(clean, userId, storiesDir, options, onProgress);
+        summary.newlyDownloaded += storiesResult.newlyDownloaded;
+        summary.downloadedItems.push(...storiesResult.items);
+      } catch (storyErr) {
+        summary.errors.push(`Story download error: ${storyErr.message}`);
       }
+    };
+
+    await Promise.all([
+      avatarTask(),
+      highlightsTask(),
+      postsTask(),
+      storiesTask()
+    ]);
+
+    if (isCache) {
+      cacheManager.flushUserIndex(clean);
     }
 
-    // 5. Download Active Stories (always checked and downloaded fresh)
-    try {
-      const storiesResult = await downloadActiveStories(clean, userId, storiesDir, options, onProgress);
-      summary.newlyDownloaded += storiesResult.newlyDownloaded;
-      summary.downloadedItems.push(...storiesResult.items);
-    } catch (storyErr) {
-      summary.errors.push(`Story download error: ${storyErr.message}`);
-    }
+    summary.durationMs = Date.now() - startedAt;
+    summary.itemsPerSec = summary.durationMs > 0
+      ? Number((summary.newlyDownloaded / (summary.durationMs / 1000)).toFixed(1))
+      : summary.newlyDownloaded;
 
     db.addLog(
-      `Content download complete for @${clean}: ${summary.newlyDownloaded} media files downloaded fresh from Instagram server.`,
+      `Content download complete for @${clean}: ${summary.newlyDownloaded} media files in ${(summary.durationMs / 1000).toFixed(1)}s (${summary.itemsPerSec} files/s).`,
       summary.newlyDownloaded > 0 ? 'success' : 'info',
       clean
     );
@@ -1113,7 +1281,9 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
     } catch (e) {}
   }
 
-  for (const item of items) {
+  const downloadConcurrency = options.concurrency || config.DOWNLOAD_CONCURRENCY || 6;
+
+  await runWithConcurrency(items, downloadConcurrency, async (item) => {
     const rawId = String(item.pk || item.id).split('_')[0];
     const storyId = `story_${rawId}`;
 
@@ -1129,64 +1299,70 @@ async function downloadActiveStories(username, userId, storiesDir, options = {},
     const mediaUrl = isVideo ? videoUrl : photoCandidate;
     const thumbCandidateUrl = photoCandidate;
 
-    if (mediaUrl) {
-      const cleanUrl = mediaUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
-      const ext = isVideo ? 'mp4' : 'jpg';
-      const fileName = `${rawId}.${ext}`;
-      const destPath = path.join(storiesDir, fileName);
+    if (!mediaUrl) return;
 
-      let thumbnailUrl = null;
-      let thumbnailPath = null;
-      if (isVideo && thumbCandidateUrl) {
-        const cleanThumb = thumbCandidateUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
-        const thumbFileName = `${rawId}_thumb.jpg`;
-        const thumbDestPath = path.join(storiesDir, thumbFileName);
-        try {
-          await downloadFile(cleanThumb, thumbDestPath, options);
-          thumbnailUrl = `${urlPrefix}/${clean}/stories/${thumbFileName}`;
-          thumbnailPath = thumbDestPath;
-        } catch (te) {}
-      } else if (!isVideo) {
-        thumbnailUrl = `${urlPrefix}/${clean}/stories/${fileName}`;
-        thumbnailPath = destPath;
-      }
+    const cleanUrl = mediaUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const ext = isVideo ? 'mp4' : 'jpg';
+    const fileName = `${rawId}.${ext}`;
+    const destPath = path.join(storiesDir, fileName);
 
-      let fileReady = false;
-      try {
-        const downloaded = await downloadFile(cleanUrl, destPath, options);
-        if (downloaded) fileReady = true;
-      } catch (err) {
-        // Fallback: Use existing valid local file if download failed
-        if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
-          fileReady = true;
-        }
-      }
+    let thumbnailUrl = null;
+    let thumbnailPath = null;
+    let fileReady = false;
 
-      if (fileReady) {
-        result.newlyDownloaded++;
-        const recorded = recordMedia({
-          id: storyId,
-          code: rawId,
-          type: isVideo ? 'story_video' : 'story',
-          fileName,
-          filePath: destPath,
-          fileUrl: `${urlPrefix}/${clean}/stories/${fileName}`,
-          thumbnailUrl: thumbnailUrl || `${urlPrefix}/${clean}/stories/${fileName}`,
-          thumbnailPath,
-          caption: `Instagram Story (${item.taken_at ? new Date(item.taken_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Active Story'})`
+    const storyTasks = [
+      downloadFile(cleanUrl, destPath, options)
+        .then(downloaded => { if (downloaded) fileReady = true; })
+        .catch(() => {
+          if (fs.existsSync(destPath) && fs.statSync(destPath).size > 1000) {
+            fileReady = true;
+          }
+        })
+    ];
+
+    if (isVideo && thumbCandidateUrl) {
+      const cleanThumb = thumbCandidateUrl.replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+      const thumbFileName = `${rawId}_thumb.jpg`;
+      const thumbDestPath = path.join(storiesDir, thumbFileName);
+      storyTasks.push(
+        downloadFile(cleanThumb, thumbDestPath, options)
+          .then(() => {
+            thumbnailUrl = `${urlPrefix}/${clean}/stories/${thumbFileName}`;
+            thumbnailPath = thumbDestPath;
+          })
+          .catch(() => {})
+      );
+    } else if (!isVideo) {
+      thumbnailUrl = `${urlPrefix}/${clean}/stories/${fileName}`;
+      thumbnailPath = destPath;
+    }
+
+    await Promise.all(storyTasks);
+
+    if (fileReady) {
+      result.newlyDownloaded++;
+      const recorded = recordMedia({
+        id: storyId,
+        code: rawId,
+        type: isVideo ? 'story_video' : 'story',
+        fileName,
+        filePath: destPath,
+        fileUrl: `${urlPrefix}/${clean}/stories/${fileName}`,
+        thumbnailUrl: thumbnailUrl || `${urlPrefix}/${clean}/stories/${fileName}`,
+        thumbnailPath,
+        caption: `Instagram Story (${item.taken_at ? new Date(item.taken_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Active Story'})`
+      });
+      result.items.push(recorded);
+      if (typeof onProgress === 'function') {
+        onProgress({
+          type: 'ITEM_DOWNLOADED',
+          item: recorded,
+          current: result.newlyDownloaded,
+          total: items.length
         });
-        result.items.push(recorded);
-        if (typeof onProgress === 'function') {
-          onProgress({
-            type: 'ITEM_DOWNLOADED',
-            item: recorded,
-            current: result.newlyDownloaded,
-            total: items.length
-          });
-        }
       }
     }
-  }
+  });
 
   return result;
 }
@@ -1431,6 +1607,7 @@ async function fetchHighlights(username, options = {}) {
 module.exports = {
   downloadTargetContent,
   downloadFile,
+  runWithConcurrency,
   fetchPostSlides,
   fetchActiveStories,
   fetchHighlights,

@@ -633,10 +633,11 @@ app.get('/api/cache/:username', (req, res) => {
   res.json({ username: clean, count: items.length, items });
 });
 
-// Download single cached item (preserved on server while user is on site)
+// Download single cached item (supports ?autoDelete=true for instant temporary cleanup)
 app.get('/api/cache/download/:username/:itemId', (req, res) => {
   const clean = cleanHandle(req.params.username);
   const itemId = req.params.itemId;
+  const autoDelete = req.query.autoDelete === 'true' || req.query.autoDelete === '1';
   const items = cacheManager.getCachedItems(clean);
   const target = items.find(i => i.id === itemId);
 
@@ -644,13 +645,69 @@ app.get('/api/cache/download/:username/:itemId', (req, res) => {
     return res.status(404).send('Cached media not found');
   }
 
-  // Stream file to client; media remains in server cache while user is browsing the site
-  res.download(target.filePath, target.fileName);
+  res.download(target.filePath, target.fileName, (err) => {
+    if (!err && autoDelete) {
+      cacheManager.deleteCachedItem(clean, itemId);
+      broadcast({ type: 'CACHE_ITEM_DELETED', data: { username: clean, itemId } });
+    }
+  });
 });
 
-// Download selected cached items as ZIP (preserved on server while user is on site)
+// Download ALL temporary cached items as a single instant ZIP (supports ?autoDelete=true)
+app.get('/api/cache/download-all/:username', (req, res) => {
+  const clean = cleanHandle(req.params.username);
+  if (!clean) {
+    return res.status(400).send('Invalid username format');
+  }
+  const autoDelete = req.query.autoDelete === 'true' || req.query.autoDelete === '1';
+  const allItems = cacheManager.getCachedItems(clean).filter(i => i.filePath && fs.existsSync(i.filePath));
+
+  if (allItems.length === 0) {
+    return res.status(404).send(`No temporary cached media found for @${clean}`);
+  }
+
+  const archive = createZipArchive({ store: true });
+  const zipFilename = `${clean}_temp_all_${allItems.length}_files_${Date.now()}.zip`;
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+
+  let hadError = false;
+  archive.on('error', (err) => {
+    hadError = true;
+    console.error(`[ZIP] Error creating full temp archive for @${clean}:`, err);
+    if (!res.headersSent) {
+      res.status(500).send('Error creating ZIP archive');
+    }
+  });
+
+  if (autoDelete) {
+    res.on('finish', () => {
+      if (!hadError) {
+        cacheManager.clearUserCache(clean);
+        broadcast({ type: 'CACHE_CLEARED', data: { username: clean, reason: 'AUTO_DELETED_AFTER_DOWNLOAD' } });
+      }
+    });
+  }
+
+  archive.pipe(res);
+
+  const seenNames = new Set();
+  for (const item of allItems) {
+    let entryName = item.fileName || path.basename(item.filePath);
+    if (seenNames.has(entryName)) {
+      entryName = `${item.id}_${entryName}`;
+    }
+    seenNames.add(entryName);
+    archive.file(item.filePath, { name: entryName });
+  }
+
+  archive.finalize();
+});
+
+// Download selected cached items as ZIP (supports autoDelete: true for instant temporary cleanup)
 app.post('/api/cache/download-selected', (req, res) => {
-  const { username, itemIds } = req.body;
+  const { username, itemIds, autoDelete = false } = req.body;
   if (!username || !Array.isArray(itemIds) || itemIds.length === 0) {
     return res.status(400).json({ error: 'Username and itemIds array are required' });
   }
@@ -673,22 +730,44 @@ app.post('/api/cache/download-selected', (req, res) => {
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
 
+  let hadError = false;
   archive.on('error', (err) => {
+    hadError = true;
     console.error(`[ZIP] Error creating selected archive for @${clean}:`, err);
     if (!res.headersSent) {
       res.status(500).send('Error creating ZIP archive');
     }
   });
 
+  if (autoDelete) {
+    const deliveredIds = selectedItems.map(i => i.id);
+    res.on('finish', () => {
+      if (!hadError) {
+        const deleted = cacheManager.deleteCachedItems(clean, deliveredIds);
+        if (deleted.length > 0) {
+          broadcast({ type: 'CACHE_ITEMS_DELETED', data: { username: clean, itemIds: deleted } });
+        }
+      }
+    });
+  }
+
   archive.pipe(res);
 
+  const seenNames = new Set();
   for (const item of selectedItems) {
-    archive.file(item.filePath, { name: item.fileName });
+    let entryName = item.fileName || path.basename(item.filePath);
+    if (seenNames.has(entryName)) {
+      entryName = `${item.id}_${entryName}`;
+    }
+    seenNames.add(entryName);
+    archive.file(item.filePath, { name: entryName });
     if (item.code) {
       const userDir = path.join(config.CACHE_DIR, clean);
       const captionPath = path.join(userDir, 'posts', `${item.code}_caption.txt`);
-      if (fs.existsSync(captionPath)) {
-        archive.file(captionPath, { name: `${item.code}_caption.txt` });
+      const capName = `${item.code}_caption.txt`;
+      if (fs.existsSync(captionPath) && !seenNames.has(capName)) {
+        seenNames.add(capName);
+        archive.file(captionPath, { name: capName });
       }
     }
   }
@@ -978,6 +1057,7 @@ const handleShutdown = (signal) => {
   storageManager.stop();
   monitor.stop();
   telegramBot.stop();
+  cacheManager.clearAllCache();
   db.flushSync(); // Ensure all debounced database changes are written to disk
 
   // Force exit if keep-alive sockets hang longer than 8s

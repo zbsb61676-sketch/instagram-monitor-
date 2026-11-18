@@ -280,6 +280,10 @@
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2">
+            <button id="downloadAllTempZipBtn" disabled class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold transition flex items-center space-x-1.5 shadow-md">
+              <i class="fa-solid fa-bolt"></i>
+              <span id="downloadAllTempText">Download All (.ZIP)</span>
+            </button>
             <button id="downloadSelectedZipBtn" disabled class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold transition flex items-center space-x-1.5 shadow-md">
               <i class="fa-solid fa-file-zipper"></i>
               <span id="downloadSelectedText">Download Selected (0) as .ZIP</span>
@@ -293,17 +297,22 @@
 
         <!-- Selection Controls & Real-Time Cache Policy Notice -->
         <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs bg-gray-950/60 p-2.5 rounded-lg border border-gray-800/80">
-          <div class="flex items-center space-x-3">
+          <div class="flex flex-wrap items-center gap-3">
             <label class="flex items-center space-x-2 cursor-pointer select-none">
               <input type="checkbox" id="selectAllCheckbox" class="w-4 h-4 rounded text-amber-500 bg-gray-900 border-gray-700 focus:ring-amber-400 cursor-pointer" />
               <span class="font-bold text-white">Select All</span>
             </label>
             <span class="text-gray-500">|</span>
             <span id="selectionSummaryText" class="text-gray-400">0 selected</span>
+            <span class="text-gray-500">|</span>
+            <label class="flex items-center space-x-2 cursor-pointer select-none" title="Immediately delete temporary server files right after your browser finishes downloading them">
+              <input type="checkbox" id="autoDeleteTempCheckbox" checked class="w-4 h-4 rounded text-emerald-500 bg-gray-900 border-gray-700 focus:ring-emerald-400 cursor-pointer" />
+              <span class="text-emerald-400 font-semibold">Auto-delete temp files after download</span>
+            </label>
           </div>
           <div class="text-[11px] text-amber-400/90 flex items-center space-x-1.5">
             <i class="fa-solid fa-shield-halved text-amber-400"></i>
-            <span>All posts & media remain on the server while you are on the site. Automatically purged when you leave.</span>
+            <span>Parallel high-speed temp staging • Auto-purged when downloaded or when you leave.</span>
           </div>
         </div>
 
@@ -818,6 +827,6 @@
     </div>
   </footer>
 
-  <script src="/app.js?v=3.6"></script>
+  <script src="/app.js?v=3.7"></script>
 </body>
 </html>

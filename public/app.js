@@ -141,10 +141,12 @@ const liveStatusText = document.getElementById('liveStatusText');
 const liveItemCounter = document.getElementById('liveItemCounter');
 const livePulseIndicator = document.getElementById('livePulseIndicator');
 const liveDownloadZipBtn = document.getElementById('liveDownloadZipBtn');
+const downloadAllTempZipBtn = document.getElementById('downloadAllTempZipBtn');
 const downloadSelectedZipBtn = document.getElementById('downloadSelectedZipBtn');
 const downloadSelectedText = document.getElementById('downloadSelectedText');
 const clearCacheBtn = document.getElementById('clearCacheBtn');
 const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+const autoDeleteTempCheckbox = document.getElementById('autoDeleteTempCheckbox');
 const selectionSummaryText = document.getElementById('selectionSummaryText');
 const liveMediaStreamGrid = document.getElementById('liveMediaStreamGrid');
 const sessionDot = document.getElementById('sessionDot');
@@ -314,11 +316,13 @@ function handleSocketMessage(msg) {
 
     case 'LIVE_DOWNLOAD_COMPLETED':
       if (liveDownloadStatusBox) {
-        liveStatusText.textContent = `✅ Ready: ${msg.data.totalItems} items cached for @${msg.data.username}`;
+        const durSec = msg.data.summary?.durationMs ? ` in ${(msg.data.summary.durationMs / 1000).toFixed(1)}s` : '';
+        const speedStr = msg.data.summary?.itemsPerSec ? ` (${msg.data.summary.itemsPerSec}/s)` : '';
+        liveStatusText.textContent = `✅ Ready: ${msg.data.totalItems} temp items cached for @${msg.data.username}${durSec}${speedStr}`;
         liveItemCounter.textContent = `${msg.data.totalItems} items`;
         if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
       }
-      showToast(`✅ Profile @${msg.data.username} cached! Select items below to download.`, 'success');
+      showToast(`✅ Profile @${msg.data.username} cached! Select items or click Download All (.ZIP).`, 'success');
       break;
 
     case 'LIVE_DOWNLOAD_FAILED':
@@ -843,6 +847,14 @@ function updateSelectionUI() {
     selectionSummaryText.textContent = `${selectedCount} of ${total} selected`;
   }
 
+  if (downloadAllTempZipBtn) {
+    downloadAllTempZipBtn.disabled = total === 0 || !activeCacheUsername;
+    const allTextEl = document.getElementById('downloadAllTempText');
+    if (allTextEl) {
+      allTextEl.textContent = total > 0 ? `Download All (${total}) .ZIP` : 'Download All (.ZIP)';
+    }
+  }
+
   if (downloadSelectedZipBtn) {
     downloadSelectedZipBtn.disabled = selectedCount === 0;
   }
@@ -895,13 +907,15 @@ async function downloadSingleCachedItem(username, itemId) {
   const targetItem = cachedMediaItems.find(i => i.id === itemId);
   const card = document.querySelector(`.media-stream-card[data-id="${itemId}"]`);
   const btn = card?.querySelector('.single-download-btn');
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
   if (btn) {
     btn.disabled = true;
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Downloading...</span>';
   }
 
   try {
-    const downloadUrl = `/api/cache/download/${encodeURIComponent(username)}/${encodeURIComponent(itemId)}`;
+    const query = autoDelete ? '?autoDelete=true' : '';
+    const downloadUrl = `/api/cache/download/${encodeURIComponent(username)}/${encodeURIComponent(itemId)}${query}`;
     const link = document.createElement('a');
     link.href = downloadUrl;
     link.download = targetItem?.fileName || 'media';
@@ -909,16 +923,17 @@ async function downloadSingleCachedItem(username, itemId) {
     link.click();
     document.body.removeChild(link);
 
-    showToast(`Downloading ${targetItem?.fileName || 'media file'}...`, 'info');
+    showToast(`Downloading ${targetItem?.fileName || 'media file'}${autoDelete ? ' (will auto-clean temp file)' : ''}...`, 'info');
 
-    // Keep media file and card available while user is on the site
-    setTimeout(() => {
-      if (btn) {
-        btn.disabled = false;
-        btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
-        btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
-      }
-    }, 600);
+    if (!autoDelete) {
+      setTimeout(() => {
+        if (btn) {
+          btn.disabled = false;
+          btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
+          btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
+        }
+      }, 600);
+    }
   } catch (err) {
     showToast(`Download failed: ${err.message}`, 'error');
     if (btn) {
@@ -928,11 +943,52 @@ async function downloadSingleCachedItem(username, itemId) {
   }
 }
 
+async function downloadAllTempCachedItems() {
+  if (!activeCacheUsername || cachedMediaItems.length === 0) return;
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
+  const count = cachedMediaItems.length;
+
+  if (downloadAllTempZipBtn) {
+    downloadAllTempZipBtn.disabled = true;
+    downloadAllTempZipBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Streaming ZIP...</span>';
+  }
+
+  try {
+    showToast(`Streaming all ${count} temporary files as ZIP${autoDelete ? ' (auto-cleaning after transfer)' : ''}...`, 'info');
+    const query = autoDelete ? '?autoDelete=true' : '';
+    const res = await fetch(`/api/cache/download-all/${encodeURIComponent(activeCacheUsername)}${query}`);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => 'ZIP creation failed');
+      throw new Error(errText || 'Failed to download full ZIP');
+    }
+
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${activeCacheUsername}_all_${count}_files.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+
+    showToast(`✅ Downloaded all ${count} files!${autoDelete ? ' Temporary files cleared.' : ''}`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    if (downloadAllTempZipBtn) {
+      downloadAllTempZipBtn.innerHTML = '<i class="fa-solid fa-bolt"></i> <span id="downloadAllTempText">Download All (.ZIP)</span>';
+    }
+    updateSelectionUI();
+  }
+}
+
 async function downloadSelectedCachedItems() {
   if (selectedMediaIds.size === 0 || !activeCacheUsername) return;
 
   const count = selectedMediaIds.size;
   const ids = Array.from(selectedMediaIds);
+  const autoDelete = autoDeleteTempCheckbox ? autoDeleteTempCheckbox.checked : false;
 
   if (downloadSelectedZipBtn) {
     downloadSelectedZipBtn.disabled = true;
@@ -947,7 +1003,8 @@ async function downloadSelectedCachedItems() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: activeCacheUsername,
-        itemIds: ids
+        itemIds: ids,
+        autoDelete
       })
     });
 
@@ -966,17 +1023,19 @@ async function downloadSelectedCachedItems() {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
 
-    // Keep all cards on screen; mark them with green Downloaded state
-    ids.forEach(id => {
-      const card = document.querySelector(`.media-stream-card[data-id="${id}"]`);
-      const btn = card?.querySelector('.single-download-btn');
-      if (btn) {
-        btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
-        btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
-      }
-    });
+    if (!autoDelete) {
+      // Keep all cards on screen; mark them with green Downloaded state
+      ids.forEach(id => {
+        const card = document.querySelector(`.media-stream-card[data-id="${id}"]`);
+        const btn = card?.querySelector('.single-download-btn');
+        if (btn) {
+          btn.className = 'single-download-btn w-full py-1 text-center rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold transition flex items-center justify-center space-x-1';
+          btn.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span>Downloaded</span>';
+        }
+      });
+    }
 
-    showToast(`✅ Downloaded ${count} items! Media remains accessible while you are on site.`, 'success');
+    showToast(`✅ Downloaded ${count} items!${autoDelete ? ' Temporary files purged from server.' : ' Media remains accessible while you are on site.'}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -1005,6 +1064,10 @@ if (selectAllCheckbox) {
     });
     updateSelectionUI();
   });
+}
+
+if (downloadAllTempZipBtn) {
+  downloadAllTempZipBtn.addEventListener('click', downloadAllTempCachedItems);
 }
 
 if (downloadSelectedZipBtn) {
@@ -1066,29 +1129,21 @@ if (liveDownloadForm) {
       if (!res.ok) throw new Error(data.error || 'Live download failed');
 
       if (data.items && data.items.length > 0) {
-        liveMediaStreamGrid.innerHTML = '';
-        cachedMediaItems = [...data.items];
-        let idx = 0;
         const total = data.items.length;
-        liveStatusText.textContent = `⚡ Ready: ${total} items cached for @${username}. Select items below to download:`;
+        const durSec = data.summary?.durationMs ? ` in ${(data.summary.durationMs / 1000).toFixed(1)}s` : '';
+        const speedStr = data.summary?.itemsPerSec ? ` (${data.summary.itemsPerSec}/s)` : '';
+        liveStatusText.textContent = `⚡ Ready: ${total} temp items cached for @${username}${durSec}${speedStr}. Click Download All or select items:`;
         if (livePulseIndicator) livePulseIndicator.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400';
-        
-        // Smooth stream animation into grid (cancel any previous stream timer)
+
+        // Reconcile without wiping cards already streamed live over WebSocket
         if (liveStreamTimer) {
           clearInterval(liveStreamTimer);
           liveStreamTimer = null;
         }
-        liveStreamTimer = setInterval(() => {
-          if (idx >= total) {
-            clearInterval(liveStreamTimer);
-            liveStreamTimer = null;
-            updateSelectionUI();
-            return;
-          }
-          const item = data.items[idx];
-          appendLiveMediaCard({ item, username, current: idx + 1, total }, false, false);
-          idx++;
-        }, 15);
+        for (const item of data.items) {
+          appendLiveMediaCard({ item, username, current: total, total }, false, true);
+        }
+        updateSelectionUI();
       } else {
         liveMediaStreamGrid.innerHTML = `
           <div class="col-span-full py-8 text-center text-gray-400">
